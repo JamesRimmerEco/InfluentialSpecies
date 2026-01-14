@@ -1,0 +1,95 @@
+# R specific files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# R environment
+renv/library/
+renv/local/
+renv/staging/
+
+# Session Data
+.RData
+.RDataTmp
+
+# Temporary files
+*~
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Data files (large files not tracked by default)
+data/raw/*
+data/processed/*.rds
+data/processed/*.csv
+data/processed/*.geojson
+data/outputs/**
+*.tif
+*.tiff
+*.shp
+*.shx
+*.dbf
+*.prj
+
+# But track configuration and documentation
+!data/processed/project_config.rds
+!data/processed/.gitkeep
+!data/raw/.gitkeep
+!data/outputs/.gitkeep
+
+# Keep directory structure
+!data/outputs/figures/.gitkeep
+!data/outputs/tables/.gitkeep
+!data/outputs/gee_exports/.gitkeep
+
+# Package archives
+*.tar.gz
+*.zip
+
+# LaTeX
+*.aux
+*.log
+*.out
+*.synctex.gz
+
+# Python (if used)
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.sublime-*
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Documentation build artifacts
+docs/_build/
+docs/.doctrees/
+
+# Logs and databases
+*.log
+*.sql
+*.sqlite
+
+# Secrets and credentials
+.env
+.Renviron
+credentials.json
+*.key
+*.pem
