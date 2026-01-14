@@ -98,5 +98,9 @@ gbif_clean <- gbif_clean %>%
 message("After de-dup: ", nrow(gbif_clean))
 
 
-
+# Summary:
+# This part of the script provides a proof-of-concept for the GBIF data pipeline using a single
+# test species. It demonstrates taxon resolution, API-based retrieval of occurrence
+# records at a European scale, basic screening for usable coordinates and acceptable
+# licences, and basic de-duplication. 
 
