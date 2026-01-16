@@ -1,0 +1,221 @@
+---
+title: "Influential species mapping - test full pull"
+author: "James EV Rimmer"
+date: "2026-01-15"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+### Introduction
+This script is a full test of the start of a production workflow which builds on code tested in the "GBIF_NBN test" script.R" script. It pulls occurrence data for a single test species and applies basic screening so that tables of data extracted from **GBIF** and **NBN** can be later combined and ready to be imported to the Google Earth Engine in later steps. 
+
+**Species test case:** *Vespula vulgaris* (common wasp)
+
+**Goal (GBIF section):**
+- demonstrate pulling data through the GBIF API (without an arbitrary record cap)
+- apply basic screening: geography, coordinate presence, accepted licence set
+- apply basic within-source de-duplication (lat/lon, ID)
+
+**Accepted licences (GBIF records):**
+- **CC0_1_0** – Public Domain Dedication
+- **CC_BY_4_0** – Attribution 4.0
+- **CC_BY_NC_4_0** – Attribution–NonCommercial 4.0
+
+### Packages
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rgbif)
+library(dplyr)
+library(readr)
+library(stringr)
+library(lubridate)
+```
+
+### Settings
+
+We set the species, geographic scope, and accepted licences for GBIF records.  
+For GBIF downloads we use paging (multiple API calls) so we can retrieve all records without a cap.
+
+```{r}
+species_name <- "Vespula vulgaris"      # scientific name
+region_scope <- "EUROPE"               # GBIF continent filter
+pause_s      <- 0.25                   # delay to reduce rate-limit risk
+
+allowed_licences <- c("CC0_1_0", "CC_BY_4_0", "CC_BY_NC_4_0")  # adjust if needed
+
+# Output location (used later when saving a clean CSV)
+output_dir <- file.path("..", "data", "raw", "wasps")
+
+# GBIF paging settings:
+# - page_size controls the size of each API call (not a cap on total records)
+# - max_records is a safety brake during development; set Inf for no cap
+page_size   <- 1000
+max_records <- Inf
+
+```
+
+## BIF taxon resolution 
+We first resolve the species name against the GBIF "backbone" so we can be sure we have a stable taxon identifier.
+
+```{r}
+# Purpose: resolve species name to a stable GBIF usageKey (avoid uncertain matching later)
+bb <- name_backbone(name = species_name)
+
+taxon_key <- bb$usageKey
+message("GBIF match: ", bb$scientificName, " (usageKey=", taxon_key, ", matchType=", bb$matchType, ")")
+
+# Display key info in the report
+tibble(
+  query = species_name,
+  matched_name = bb$scientificName,
+  usageKey = taxon_key,
+  matchType = bb$matchType
+)
+
+```
+
+## GBIF occurence pull
+We now pull all GBIF occurrence records for this taxon within the chosen geographic area.  
+GBIF returns results in pages, so we iterate over pages until we have pulled the full set.
+
+A small “record check” is included to confirm which licence strings are present in the raw pull before we filter.
+
+
+```{r}
+# Purpose: pull all GBIF occurrences for the species within the chosen scope (see settings above) 
+
+# ---- Checkpoint + retry settings (for long pulls) ----
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)  # ensure output folder exists for checkpoint files
+
+slug <- stringr::str_replace_all(tolower(species_name), "[^a-z0-9]+", "_") %>% 
+  stringr::str_replace_all("^_+|_+$", "")  # trim leading/trailing underscores
+ # make a safe file-friendly species label (used in filenames)
+
+ckpt_file <- file.path(output_dir, paste0("gbif_pull_checkpoint_", slug, ".rds"))  # where we save progress for resume
+
+max_retries <- 5          # how many times to retry a failed page request before giving up
+retry_base_wait_s <- 10   # base wait between retries; multiplies by attempt number (10s, 20s, 30s, ...)
+
+start <- 0                     # record offset for paging through GBIF results (0 = start of result set)
+all_pages <- list()            # container to store each page of results (combined at the end)
+total_expected <- NA_integer_  # total number of matching records (read from GBIF meta on first successful call)
+
+# If a checkpoint exists, resume instead of starting from scratch
+if (file.exists(ckpt_file)) {
+  ckpt <- readRDS(ckpt_file)            # load previously saved progress
+  start <- ckpt$start                   # resume from the last recorded offset
+  all_pages <- ckpt$all_pages           # keep pages already downloaded
+  total_expected <- ckpt$total_expected # retain expected total for progress tracking
+
+  message("Resuming GBIF pull from start = ", start,
+          " (pages already stored: ", length(all_pages), ").")
+}
+
+repeat {
+  Sys.sleep(pause_s) # small pause to avoid hammering the GBIF API
+
+  # ---- Page request with retries (handles transient curl/network drops) ----
+  res <- NULL
+  for (attempt in seq_len(max_retries)) {
+    res <- tryCatch(
+      occ_search(
+        taxonKey = taxon_key,        # stable GBIF identifier for the species
+        continent = region_scope,    # restrict records to the chosen geographic scope
+        hasCoordinate = TRUE,        # only return records with spatial coordinates (required for mapping + later dedup)
+        limit = page_size,           # number of records per API call (page size; not a cap on total records)
+        start = start                # offset for this page within the full result set
+      ),
+      error = function(e) e          # capture the error so we can retry instead of crashing immediately
+    )
+
+    if (!inherits(res, "error")) break  # success: exit retry loop and continue
+
+    wait_s <- retry_base_wait_s * attempt # increasing backoff gives the API/network time to recover
+    message("GBIF request failed at start = ", start,
+            " (attempt ", attempt, "/", max_retries, "): ",
+            conditionMessage(res),
+            " | waiting ", wait_s, "s then retrying...")
+    Sys.sleep(wait_s)
+  }
+
+  # If it still fails after retries, save progress and stop (so we can resume later)
+  if (inherits(res, "error")) {
+    saveRDS(list(start = start, all_pages = all_pages, total_expected = total_expected), ckpt_file)
+    stop(res)
+  }
+
+  # Total number of records that match the query in GBIF (across all pages); captured once for progress tracking
+  if (is.na(total_expected)) total_expected <- res$meta$count
+
+  # Safety check: stop paging if the API returns an empty page (no records)
+  if (length(res$data) == 0) break
+
+  all_pages[[length(all_pages) + 1]] <- res$data  # append this page of records to our list of pages
+
+  # Save progress after each successful page so we don't lose work if the session/connection dies
+  saveRDS(list(start = start, all_pages = all_pages, total_expected = total_expected), ckpt_file)
+
+  pulled_so_far <- start + nrow(res$data) # number pulled so far = start offset + rows returned in this page
+  message("Pulled ", pulled_so_far, " / ", total_expected, " rows...")
+
+  # Stop when we have everything (or hit the development safety brake)
+  if (pulled_so_far >= total_expected) break
+  if (pulled_so_far >= max_records) {
+    message("Reached max_records safety limit (", max_records, ").")
+    break
+  }
+
+  start <- start + nrow(res$data) # advance by what we actually received (avoids skipping if a page is short)
+}
+
+gbif_raw <- bind_rows(all_pages) # combine all pages into one data frame for downstream cleaning/screening
+
+message("GBIF expected rows (query): ", total_expected)
+message("GBIF rows pulled (paged):  ", nrow(gbif_raw))
+
+```
+
+## Record check (raw pull)
+
+Before any screening, we check:
+- the licence strings present in the raw pull (as GBIF supplies them)
+- a quick glimpse of key fields, just to confirm the structure is as expected
+
+```{r}
+# Inspect what we pulled before filtering (including licence strings)
+
+# Licence strings as supplied by GBIF (typically URLs)
+gbif_raw %>%
+  count(license, sort = TRUE) %>%
+  mutate(prop = n / sum(n)) %>%
+  print(n = Inf)
+
+# Quick structure check on key fields
+gbif_raw %>%
+  select(gbifID, occurrenceID, decimalLongitude, decimalLatitude, eventDate, year, countryCode, license) %>%
+  head(10)
+
+```
+
+## Basic screening + essential fields
+
+GBIF supplies licence information as URLs. We normalise these URLs to short codes and then filter to an accepted set (this might not filter in practice if all licenses are acceptable).   
+We also keep only the essential fields we’ll need later (including for cross-source duplicate checks and GEE import).
+
+```{r}
+
+
+
+```
+
+
+
+
+
+
+
+
+
