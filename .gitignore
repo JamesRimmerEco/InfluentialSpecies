@@ -8,3 +8,4 @@
 # Raw data and intermediate pulls
 data/raw/
 data/raw/checkpoints/
+data/checkpoints/
