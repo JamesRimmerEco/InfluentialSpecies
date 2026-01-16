@@ -5,7 +5,7 @@
 # Goal: 
 # - demonstrate pulling of data through the API
 # - apply basic screening: Geographical, appropriate licence, non-redundancy
-# - Create a clean file suitable for later upload as a Google Earth Engine (GEE) asset. 
+# - In principle sets up data frames which could be combined for later upload as a Google Earth Engine (GEE) asset. 
 
 # ---- Licence definitions (GBIF records) ----
 # CC0_1_0:
@@ -54,20 +54,46 @@ gbif_raw <- occ_search(
 
 message("GBIF raw rows: ", nrow(gbif_raw))
 
-### Basic screening + essential fields ###
-
 # licence filter
+# Note: GBIF provides licence as a URL in column `license` (US spelling).
 lic_normalise <- function(x) {
-  case_when(
-    str_detect(x, "publicdomain/zero/1.0") ~ "CC0_1_0",
-    str_detect(x, "licences/by/4.0") ~ "CC_BY_4_0",
-    str_detect(x, "licences/by-nc/4.0") ~ "CC_BY_NC_4_0",
+  dplyr::case_when(
+    stringr::str_detect(x, "publicdomain/zero/1.0") ~ "CC0_1_0",
+    stringr::str_detect(x, "licenses/by/4.0") ~ "CC_BY_4_0",        # CC URLs use 'licenses' (US spelling)
+    stringr::str_detect(x, "licenses/by-nc/4.0") ~ "CC_BY_NC_4_0",
     TRUE ~ NA_character_
   )
 }
 
+message("GBIF licence breakdown (RAW pull):")
+gbif_raw %>%
+  count(license, sort = TRUE) %>%
+  mutate(prop = n / sum(n)) %>%
+  print(n = Inf)
+
+# How many would pass our accepted licence filter?
+gbif_raw %>%
+  mutate(licence_std = lic_normalise(license)) %>%
+  summarise(
+    n_raw = n(),
+    n_accepted = sum(licence_std %in% allowed_licences, na.rm = TRUE),
+    prop_accepted = n_accepted / n_raw
+  ) %>%
+  print()
+
+# What licences exist that are NOT in our accepted set (after normalisation)?
+message("GBIF non-accepted licence categories (RAW pull, after normalisation):")
+gbif_raw %>%
+  mutate(licence_std = lic_normalise(license)) %>%
+  filter(!is.na(licence_std) & !licence_std %in% allowed_licences) %>%
+  count(licence_std, sort = TRUE) %>%
+  print(n = Inf)
+
+
+### Basic screening + essential fields ###
+
 gbif_clean <- gbif_raw %>%
-  transmute(
+  dplyr::transmute(
     source = "GBIF",
     species = species_name,
     gbifID = gbifID,
@@ -77,11 +103,12 @@ gbif_clean <- gbif_raw %>%
     date = eventDate,
     year = year,
     country = countryCode,
-    licence_raw = licence,
-    licence = lic_normalise(licence)
+    licence_raw = license,              # <-- was `licence` (doesn't exist in GBIF data)
+    licence = lic_normalise(license)    # <-- normalise the GBIF `license` URL
   ) %>%
-  filter(!is.na(lon), !is.na(lat)) %>%
-  filter(licence %in% allowed_licences)
+  dplyr::filter(!is.na(lon), !is.na(lat)) %>%
+  dplyr::filter(licence %in% allowed_licences)
+
 
 message("GBIF after coord+licence screen: ", nrow(gbif_clean))
 message("Licence breakdown (clean):")
@@ -95,7 +122,7 @@ gbif_clean <- gbif_clean %>%
   distinct(gbifID, .keep_all = TRUE) %>%
   distinct(lon, lat, date, .keep_all = TRUE)
 
-message("After de-dup: ", nrow(gbif_clean))
+message("After de-duplication: ", nrow(gbif_clean))
 
 
 # Summary:
@@ -147,9 +174,6 @@ nbn_raw <- galah_call() |>
 
 message("NBN raw rows: ", nrow(nbn_raw))
 
-# Basic screening + essential fields (NBN)
-# Purpose: standardise to our selected columns, then screen to usable coords + accepted licence set.
-# Note: the returned licence column name includes a colon: `dcterms:license`.
 lic_normalise_nbn <- function(x) {
   x_l <- stringr::str_to_lower(x)
   
@@ -165,6 +189,35 @@ lic_normalise_nbn <- function(x) {
     TRUE ~ NA_character_
   )
 }
+
+message("NBN licence breakdown (RAW pull):")
+nbn_raw %>%
+  count(`dcterms:license`, sort = TRUE) %>%
+  mutate(prop = n / sum(n)) %>%
+  print(n = Inf)
+
+# How many would pass our accepted licence filter?
+nbn_raw %>%
+  mutate(licence_std = lic_normalise_nbn(`dcterms:license`)) %>%
+  summarise(
+    n_raw = n(),
+    n_accepted = sum(licence_std %in% allowed_licences_nbn, na.rm = TRUE),
+    prop_accepted = n_accepted / n_raw
+  ) %>%
+  print()
+
+# What licences exist that are NOT in our accepted set?
+message("NBN non-accepted licence categories (RAW pull, after normalisation):")
+nbn_raw %>%
+  mutate(licence_std = lic_normalise_nbn(`dcterms:license`)) %>%
+  filter(!is.na(licence_std) & !licence_std %in% allowed_licences_nbn) %>%
+  count(licence_std, sort = TRUE) %>%
+  print(n = Inf)
+
+
+# Basic screening + essential fields (NBN)
+# Purpose: standardise to our selected columns, then screen to usable coords + accepted licence set.
+# Note: the returned licence column name includes a colon: `dcterms:license`.
 
 nbn_clean <- nbn_raw %>%
   dplyr::transmute(
@@ -191,7 +244,7 @@ nbn_clean <- nbn_clean %>%
   dplyr::distinct(recordID, .keep_all = TRUE) %>%
   dplyr::distinct(lon, lat, date, .keep_all = TRUE)
 
-message("NBN after de-dup: ", nrow(nbn_clean))
+message("NBN after de-duplication: ", nrow(nbn_clean))
 
 # Summary:
 # This script provides a proof-of-concept workflow for pulling and lightly screening
