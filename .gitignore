@@ -1,11 +1,36 @@
-# R specific files
 .Rproj.user/
 .Rhistory
 .RData
 .Ruserdata
 *.Rproj
 
-# Raw data and intermediate pulls
-data/raw/
-data/raw/checkpoints/
-data/checkpoints/
+# Data folders (keep structure, ignore contents due to size)
+
+# Raw data
+data/raw/**
+!data/raw/**/.gitkeep
+
+# Checkpoints
+data/_checkpoints/**
+!data/_checkpoints/**/.gitkeep
+
+# Backwards-compatibility (if any older checkpoint folders still exist)
+data/checkpoints/**
+!data/checkpoints/**/.gitkeep
+data/raw/checkpoints/**
+!data/raw/checkpoints/**/.gitkeep
+
+# Rendered reports / misc outputs 
+*.html
+*.docx
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.gif
+*.zip
+*.tar.gz
+*.rds
+*.RData
