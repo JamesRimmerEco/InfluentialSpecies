@@ -486,8 +486,3 @@ At this point we have:
 - standardised essential fields, filtered to accepted licences and usable coordinates
 - applied light de-duplication by coordinates + date, and ID
 - saved a clean CSV for reuse
-
-
-
-
-
