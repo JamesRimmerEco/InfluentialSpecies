@@ -486,3 +486,309 @@ At this point we have:
 - standardised essential fields, filtered to accepted licences and usable coordinates
 - applied light de-duplication by coordinates + date, and ID
 - saved a clean CSV for reuse
+
+# ============================================================
+## Merge GBIF + NBN and check cross-source duplicates
+
+At this point we have two screened and within-source de-duplicated tables:
+
+- `gbif_clean` (GBIF, Europe-wide)
+- `nbn_clean` (NBN Atlas, UK-only)
+
+The next step is to combine these into a single table and check for records that may be present in both sources. There is no shared universal record ID between GBIF and NBN, so the safest cross-source duplicate check has to be approximate.
+
+### Checking for duplicates 
+
+**What we use as a matching key**
+- **Species name** (here, one test species)
+- **Location** (lon/lat, rounded to a fixed number of decimal places)
+- **Time**
+  - *Strict:* same **day** (only when we can safely extract a day from the date string)
+  - *Loose:* same **year** (used only as a flag, not an automatic de-duplicate)
+
+**Why it’s approximate**
+- Coordinates can be rounded differently between sources, or have small jitter.
+- GBIF dates are not always a clean single day (they can be timestamps, ranges, or missing).
+- Two different observers could genuinely record the same species at the same location on the same day. If we collapse those, we might be losing true separate records.
+
+**Safety rule**
+- We only remove cross-source duplicates automatically when the match is a simple one-to-one pair (exactly one GBIF record and one NBN record for the same strict day-level key).
+- Anything messier than that is kept, but clearly flagged and printed so I can sanity check it. 
+
+```{r}
+# Purpose: stop early if the expected cleaned tables are not present
+if (!exists("gbif_clean")) stop("gbif_clean not found - run the GBIF section first.")
+if (!exists("nbn_clean")) stop("nbn_clean not found - run the NBN section first.")
+```
+
+## Standardise both tables into a common shape
+
+We standardise column names so GBIF and NBN can be bound row-wise cleanly, while still keeping traceability back to each source.
+
+```{r}
+# Purpose: standardise GBIF and NBN into the same column set for merging
+
+gbif_merge <- gbif_clean %>%
+  transmute(
+    source = source,                      # "GBIF"
+    species = species,
+    record_id = as.character(gbifID),     # source-specific unique ID (GBIF ID)
+    occurrenceID = as.character(occurrenceID),
+    lon = lon,
+    lat = lat,
+    date_raw = as.character(date),        # keep raw date string exactly as supplied
+    year = as.integer(year),
+    country = as.character(country),
+    licence_raw = as.character(licence_raw),
+    licence = as.character(licence)
+  )
+
+nbn_merge <- nbn_clean %>%
+  transmute(
+    source = source,                      # "NBN"
+    species = species,
+    record_id = as.character(recordID),   # source-specific unique ID (NBN recordID)
+    occurrenceID = NA_character_,         # not available for NBN in our pull (could change this)
+    lon = lon,
+    lat = lat,
+    date_raw = as.character(date),        # NBN dates are usually already day-level
+    year = as.integer(year),
+    country = "GB",                       # NBN Atlas is UK-only; set a consistent country label for merging
+    licence_raw = as.character(licence_raw),
+    licence = as.character(licence)
+  )
+
+# Combine into one table (still contains duplicates, if any)
+occ_all <- bind_rows(gbif_merge, nbn_merge)
+
+message("Rows before merge: GBIF=", nrow(gbif_merge), " | NBN=", nrow(nbn_merge))
+message("Rows after merge (no cross-source de-duplicating yet): ", nrow(occ_all))
+```
+
+## Derive date precision and create duplicate-check keys
+
+GBIF `eventDate` is not always a single day, so we only treat a date as “day-level” if it clearly starts with `YYYY-MM-DD` and is not a range (e.g. contains `/`).
+
+We also round coordinates to a fixed number of decimal places so small differences don’t prevent matching. This is a judgement call: tighter rounding = fewer false matches but more missed duplicates; looser rounding = more matches but greater risk of collapsing genuinely distinct points.
+
+```{r}
+# Purpose: create strict (day-level) and loose (year-level) matching keys
+
+coord_round_dp <- 4  # 4 dp ~ ~10 m; increase to be stricter, decrease to be more tolerant
+
+occ_all <- occ_all %>%
+  mutate(
+    # Round lon/lat and format as fixed-width strings for stable key construction
+    lon_key = if_else(is.na(lon), NA_character_,
+                      sprintf(paste0("%.", coord_round_dp, "f"), round(lon, coord_round_dp))),
+    lat_key = if_else(is.na(lat), NA_character_,
+                      sprintf(paste0("%.", coord_round_dp, "f"), round(lat, coord_round_dp))),
+
+    # Identify obvious date ranges (GBIF sometimes returns intervals like "2015-01-01/2015-12-31")
+    date_is_range = !is.na(date_raw) & str_detect(date_raw, "/"),
+
+    # Extract a day string only when it looks like an ISO day and isn't a range
+    date_day_str = if_else(
+      !is.na(date_raw) & !date_is_range & str_detect(date_raw, "^\\d{4}-\\d{2}-\\d{2}"),
+      substr(date_raw, 1, 10),
+      NA_character_
+    ),
+
+    # Parse to Date (quiet=TRUE avoids warnings for odd strings; returns NA if it can't parse)
+    date_day = lubridate::ymd(date_day_str, quiet = TRUE),
+
+    # Track what precision we actually have available
+    date_precision = case_when(
+      !is.na(date_day) ~ "day",
+      !is.na(year) ~ "year",
+      TRUE ~ "unknown"
+    ),
+
+    # Strict key: same species + rounded coords + same day (only when day is available)
+    key_day = if_else(
+      date_precision == "day",
+      paste(species, lon_key, lat_key, as.character(date_day), sep = "|"),
+      NA_character_
+    ),
+
+    # Loose key: same species + rounded coords + same year (used for flagging only)
+    key_year = if_else(
+      !is.na(year),
+      paste(species, lon_key, lat_key, as.character(year), sep = "|"),
+      NA_character_
+    )
+  )
+
+# Quick check: what date precision do we actually have by source?
+occ_all %>%
+  count(source, date_precision, sort = TRUE) %>%
+  print(n = Inf)
+```
+
+## Cross-source duplicate check (strict day-level)
+
+This identifies candidate duplicates where both sources have at least one record with the same strict day-level key.
+
+These are the strongest candidates for “same observation listed twice”, but they are not guaranteed duplicates.
+
+```{r}
+# Purpose: find strict cross-source duplicate groups (same day + rounded coords)
+
+dup_day_groups <- occ_all %>%
+  filter(!is.na(key_day)) %>%                 # strict matching only possible when a day-level date exists
+  group_by(key_day) %>%
+  summarise(
+    n_total = n(),
+    n_gbif = sum(source == "GBIF"),
+    n_nbn  = sum(source == "NBN"),
+    .groups = "drop"
+  ) %>%
+  filter(n_gbif > 0 & n_nbn > 0) %>%          # must appear in both sources
+  arrange(desc(n_total))
+
+message("Strict cross-source duplicate groups (day-level): ", nrow(dup_day_groups))
+message("Strict cross-source duplicate records involved (day-level): ", sum(dup_day_groups$n_total))
+
+# Distribution of group sizes (helpful to spot messy cases where rounding may be too loose)
+dup_day_groups %>%
+  count(n_total, sort = TRUE) %>%
+  print(n = Inf)
+
+# Show a small sample of candidate duplicates for sanity checking
+if (nrow(dup_day_groups) > 0) {
+  example_keys <- head(dup_day_groups$key_day, 3)
+
+  occ_all %>%
+    filter(key_day %in% example_keys) %>%
+    arrange(key_day, source) %>%
+    select(source, record_id, occurrenceID, lon, lat, date_raw, date_day, year, country, licence) %>%
+    print(n = Inf)
+}
+```
+
+## Cross-source duplicate check (loose year-level only)
+
+This flags cases where both sources have records in the same rounded location and year, but at least one record lacks a usable day-level date. These are possible duplicates, but are much less certain, so we do not remove them automatically.
+
+```{r}
+# Purpose: flag loose cross-source duplicates (same year + rounded coords), used for review only
+
+dup_year_loose_groups <- occ_all %>%
+  filter(!is.na(key_year)) %>%
+  group_by(key_year) %>%
+  summarise(
+    n_total = n(),
+    n_gbif = sum(source == "GBIF"),
+    n_nbn  = sum(source == "NBN"),
+    any_not_day = any(date_precision != "day"),  # at least one record only has year/unknown precision
+    .groups = "drop"
+  ) %>%
+  filter(n_gbif > 0 & n_nbn > 0 & any_not_day) %>%
+  arrange(desc(n_total))
+
+message("Loose cross-source duplicate groups (year-level, at least one record not day-precise): ", nrow(dup_year_loose_groups))
+
+# Show a small sample for inspection (these are the ones most likely to be ambiguous)
+if (nrow(dup_year_loose_groups) > 0) {
+  example_keys <- head(dup_year_loose_groups$key_year, 3)
+
+  occ_all %>%
+    filter(key_year %in% example_keys) %>%
+    arrange(key_year, source) %>%
+    select(source, record_id, occurrenceID, lon, lat, date_raw, date_precision, year, country, licence) %>%
+    print(n = Inf)
+}
+```
+
+## Build merged outputs and apply conservative cross-source de-duplication
+
+Here we produce two outputs:
+
+1) `occ_merged_all`  
+   Everything combined, with flags showing which records are part of strict/loose cross-source duplicate groups.
+
+2) `occ_merged_dedup_strict`  
+   A conservative de-duplicated version where we remove only clear one-to-one strict duplicates.
+
+**Important:** We only drop records for strict groups that are exactly one GBIF + one NBN record. If a group is larger than that, it stays in the data and is flagged for review (because rounding could be collapsing nearby-but-distinct points, or there could be multiple genuine observations).
+
+```{r}
+# Purpose: flag duplicates and create a conservative de-duplicated table
+
+# Mark strict day-level duplicate membership
+strict_keys <- dup_day_groups$key_day
+
+# Mark loose year-level duplicate membership
+loose_year_keys <- dup_year_loose_groups$key_year
+
+occ_merged_all <- occ_all %>%
+  mutate(
+    cross_dup_day = !is.na(key_day) & key_day %in% strict_keys,
+    cross_dup_year_loose = !is.na(key_year) & key_year %in% loose_year_keys
+  )
+
+# Identify strictly one-to-one groups only (the safest automatic de-duplicate case)
+one_to_one_keys <- dup_day_groups %>%
+  filter(n_total == 2 & n_gbif == 1 & n_nbn == 1) %>%
+  pull(key_day)
+
+message("Strict one-to-one duplicate groups (safe auto de-duplicate): ", length(one_to_one_keys))
+
+# Conservative de-duplicate rule:
+# - For one-to-one strict duplicates, keep the GBIF record and drop the NBN record
+#   (this is arbitrary; we could flip the condition below)
+occ_merged_dedup_strict <- occ_merged_all %>%
+  mutate(
+    drop = !is.na(key_day) & key_day %in% one_to_one_keys & source == "NBN"
+  ) %>%
+  filter(!drop) %>%
+  select(-drop)
+
+message("Rows in merged (all):          ", nrow(occ_merged_all))
+message("Rows in merged (dedup strict): ", nrow(occ_merged_dedup_strict))
+message("Rows dropped by strict de-dup: ", nrow(occ_merged_all) - nrow(occ_merged_dedup_strict))
+
+# Safety check: show any strict duplicate groups that are NOT one-to-one (these are left in place intentionally)
+dup_day_risky <- dup_day_groups %>%
+  filter(!(n_total == 2 & n_gbif == 1 & n_nbn == 1))
+
+message("Strict cross-source groups retained for review (not one-to-one): ", nrow(dup_day_risky))
+
+if (nrow(dup_day_risky) > 0) {
+  print(head(dup_day_risky, 10), n = Inf)
+}
+```
+
+## Save merged outputs
+
+We save both versions so we can decide later whether to use the conservative de-duplicated table, or work from the “all records” version with duplicate flags.
+
+```{r}
+# Purpose: save merged tables (all + conservative strict de-dup)
+
+merge_out_dir <- file.path("..", "data", "processed", "merged", "wasps")
+dir.create(merge_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+merged_all_outfile <- file.path(merge_out_dir, paste0("merged_gbif_nbn_", slug, "_all.csv"))
+merged_dedup_outfile <- file.path(merge_out_dir, paste0("merged_gbif_nbn_", slug, "_dedup_strict.csv"))
+
+write_csv(occ_merged_all, merged_all_outfile)
+write_csv(occ_merged_dedup_strict, merged_dedup_outfile)
+
+merged_all_outfile
+merged_dedup_outfile
+```
+
+## Merge summary
+
+At this point we have:
+- a combined GBIF+NBN table (`occ_merged_all`) with flags for potential cross-source duplicates
+- a conservative de-duplicated version (`occ_merged_dedup_strict`) where only one-to-one strict duplicates are removed
+- printed summaries showing:
+  - how many strict day-level duplicate groups exist
+  - whether any groups look “messy” (which can indicate coordinate rounding is too loose, or dense repeated records)
+
+The loose year-level duplicate groups are retained and only flagged, because they are much more likely to be ambiguous.
+
+
+
