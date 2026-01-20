@@ -97,89 +97,91 @@ A small “record check” is included to confirm which licence strings are pres
 dir.create(gbif_out_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(gbif_ckpt_dir, recursive = TRUE, showWarnings = FALSE)
 
-ckpt_file <- file.path(gbif_ckpt_dir, paste0("gbif_pull_checkpoint_", slug, ".rds"))
- # where we save progress for resuming
+# Clean output file (used as a cache when knitting)
+gbif_outfile <- file.path(gbif_out_dir, paste0("gbif_", slug, "_clean.csv"))
 
-max_retries <- 5          # how many times to retry a failed page request before giving up
-retry_base_wait_s <- 10   # base wait between retries; multiplies by attempt number (10s, 20s, 30s, ...)
+# If the clean file already exists, load it and skip the API pull
+if (file.exists(gbif_outfile)) {
 
-start <- 0                     # record offset for paging through GBIF results (0 = start of result set)
-all_pages <- list()            # container to store each page of results (combined at the end)
-total_expected <- NA_integer_  # total number of matching records (read from GBIF meta on first successful call)
+  message("Found existing GBIF clean file; skipping API pull: ", gbif_outfile)
+  gbif_clean <- readr::read_csv(gbif_outfile, show_col_types = FALSE)
 
-# If a checkpoint exists, resume instead of starting from scratch
-if (file.exists(ckpt_file)) {
-  ckpt <- readRDS(ckpt_file)            # load previously saved progress
-  start <- ckpt$start                   # resume from the last recorded offset
-  all_pages <- ckpt$all_pages           # keep pages already downloaded
-  total_expected <- ckpt$total_expected # retain expected total for progress tracking
+} else {
 
-  message("Resuming GBIF pull from start = ", start,
-          " (pages already stored: ", length(all_pages), ").")
-}
+  ckpt_file <- file.path(gbif_ckpt_dir, paste0("gbif_pull_checkpoint_", slug, ".rds"))
+  # where we save progress for resuming
 
-repeat {
-  Sys.sleep(pause_s) # small pause to avoid hammering the GBIF API
+  max_retries <- 5
+  retry_base_wait_s <- 10
 
-  # ---- Page request with retries (handles transient curl/network drops) ----
-  res <- NULL
-  for (attempt in seq_len(max_retries)) {
-    res <- tryCatch(
-      occ_search(
-        taxonKey = taxon_key,        # stable GBIF identifier for the species
-        continent = region_scope,    # restrict records to the chosen geographic scope
-        hasCoordinate = TRUE,        # only return records with spatial coordinates (required for mapping + later dedup)
-        limit = page_size,           # number of records per API call (page size; not a cap on total records)
-        start = start                # offset for this page within the full result set
-      ),
-      error = function(e) e          # capture the error so we can retry instead of crashing immediately
-    )
+  start <- 0
+  all_pages <- list()
+  total_expected <- NA_integer_
 
-    if (!inherits(res, "error")) break  # success: exit retry loop and continue
+  if (file.exists(ckpt_file)) {
+    ckpt <- readRDS(ckpt_file)
+    start <- ckpt$start
+    all_pages <- ckpt$all_pages
+    total_expected <- ckpt$total_expected
 
-    wait_s <- retry_base_wait_s * attempt # increasing backoff gives the API/network time to recover
-    message("GBIF request failed at start = ", start,
-            " (attempt ", attempt, "/", max_retries, "): ",
-            conditionMessage(res),
-            " | waiting ", wait_s, "s then retrying...")
-    Sys.sleep(wait_s)
+    message("Resuming GBIF pull from start = ", start,
+            " (pages already stored: ", length(all_pages), ").")
   }
 
-  # If it still fails after retries, save progress and stop (so we can resume later)
-  if (inherits(res, "error")) {
+  repeat {
+    Sys.sleep(pause_s)
+
+    res <- NULL
+    for (attempt in seq_len(max_retries)) {
+      res <- tryCatch(
+        occ_search(
+          taxonKey = taxon_key,
+          continent = region_scope,
+          hasCoordinate = TRUE,
+          limit = page_size,
+          start = start
+        ),
+        error = function(e) e
+      )
+
+      if (!inherits(res, "error")) break
+
+      wait_s <- retry_base_wait_s * attempt
+      message("GBIF request failed at start = ", start,
+              " (attempt ", attempt, "/", max_retries, "): ",
+              conditionMessage(res),
+              " | waiting ", wait_s, "s then retrying...")
+      Sys.sleep(wait_s)
+    }
+
+    if (inherits(res, "error")) {
+      saveRDS(list(start = start, all_pages = all_pages, total_expected = total_expected), ckpt_file)
+      stop(res)
+    }
+
+    if (is.na(total_expected)) total_expected <- res$meta$count
+    if (length(res$data) == 0) break
+
+    all_pages[[length(all_pages) + 1]] <- res$data
     saveRDS(list(start = start, all_pages = all_pages, total_expected = total_expected), ckpt_file)
-    stop(res)
+
+    pulled_so_far <- start + nrow(res$data)
+    message("Pulled ", pulled_so_far, " / ", total_expected, " rows...")
+
+    if (pulled_so_far >= total_expected) break
+    if (pulled_so_far >= max_records) {
+      message("Reached max_records safety limit (", max_records, ").")
+      break
+    }
+
+    start <- start + nrow(res$data)
   }
 
-  # Total number of records that match the query in GBIF (across all pages); captured once for progress tracking
-  if (is.na(total_expected)) total_expected <- res$meta$count
+  gbif_raw <- bind_rows(all_pages)
 
-  # Safety check: stop paging if the API returns an empty page (no records)
-  if (length(res$data) == 0) break
-
-  all_pages[[length(all_pages) + 1]] <- res$data  # append this page of records to our list of pages
-
-  # Save progress after each successful page so we don't lose work if the session/connection dies
-  saveRDS(list(start = start, all_pages = all_pages, total_expected = total_expected), ckpt_file)
-
-  pulled_so_far <- start + nrow(res$data) # number pulled so far = start offset + rows returned in this page
-  message("Pulled ", pulled_so_far, " / ", total_expected, " rows...")
-
-  # Stop when we have everything (or hit the development safety brake)
-  if (pulled_so_far >= total_expected) break
-  if (pulled_so_far >= max_records) {
-    message("Reached max_records safety limit (", max_records, ").")
-    break
-  }
-
-  start <- start + nrow(res$data) # advance by what we actually received (avoids skipping if a page is short)
+  message("GBIF expected rows (query): ", total_expected)
+  message("GBIF rows pulled (paged):  ", nrow(gbif_raw))
 }
-
-gbif_raw <- bind_rows(all_pages) # combine all pages into one data frame for downstream cleaning/screening
-
-message("GBIF expected rows (query): ", total_expected)
-message("GBIF rows pulled (paged):  ", nrow(gbif_raw))
-
 ```
 
 ## Record check (raw pull)
@@ -192,15 +194,30 @@ Before any screening, we check:
 # Inspect what we pulled before filtering (including licence strings)
 
 # Licence strings as supplied by GBIF (typically URLs)
-gbif_raw %>%
-  count(license, sort = TRUE) %>%
-  mutate(prop = n / sum(n)) %>%
-  print(n = Inf)
+if (exists("gbif_raw")) {
 
-# Quick structure check on key fields
-gbif_raw %>%
-  select(gbifID, occurrenceID, decimalLongitude, decimalLatitude, eventDate, year, countryCode, license) %>%
-  head(10)
+  gbif_raw %>%
+    count(license, sort = TRUE) %>%
+    mutate(prop = n / sum(n)) %>%
+    print(n = Inf)
+
+  gbif_raw %>%
+    select(gbifID, occurrenceID, decimalLongitude, decimalLatitude, eventDate, year, countryCode, license) %>%
+    head(10)
+
+} else {
+
+  message("GBIF raw pull not present in this session (loaded cached clean CSV instead).")
+
+  gbif_clean %>%
+    count(licence_raw, sort = TRUE) %>%
+    mutate(prop = n / sum(n)) %>%
+    print(n = Inf)
+
+  gbif_clean %>%
+    select(gbifID, occurrenceID, lon, lat, date, year, country, licence_raw, licence) %>%
+    head(10)
+}
 
 ```
 
@@ -222,29 +239,35 @@ lic_normalise <- function(x) {
   )
 }
 
-gbif_clean <- gbif_raw %>%
-  transmute(
-    source = "GBIF",
-    species = species_name,
-    gbifID = gbifID,
-    occurrenceID = occurrenceID,
-    lon = decimalLongitude,
-    lat = decimalLatitude,
-    date = eventDate,
-    year = year,
-    country = countryCode,
-    licence_raw = license,
-    licence = lic_normalise(license)
-  ) %>%
-  filter(!is.na(lon), !is.na(lat)) %>%
-  filter(!is.na(licence) & licence %in% allowed_licences)
+if (exists("gbif_raw")) {
 
-message("GBIF rows (raw -> screened): ", nrow(gbif_raw), " -> ", nrow(gbif_clean))
+  gbif_clean <- gbif_raw %>%
+    transmute(
+      source = "GBIF",
+      species = species_name,
+      gbifID = gbifID,
+      occurrenceID = occurrenceID,
+      lon = decimalLongitude,
+      lat = decimalLatitude,
+      date = eventDate,
+      year = year,
+      country = countryCode,
+      licence_raw = license,
+      licence = lic_normalise(license)
+    ) %>%
+    filter(!is.na(lon), !is.na(lat)) %>%
+    filter(!is.na(licence) & licence %in% allowed_licences)
+
+  message("GBIF rows (raw -> screened): ", nrow(gbif_raw), " -> ", nrow(gbif_clean))
+
+} else {
+
+  message("Skipping GBIF screening (already loaded screened/de-duplicated gbif_clean from CSV).")
+}
 
 # Quick summaries
 gbif_clean %>% count(licence, sort = TRUE)
 gbif_clean %>% count(country, sort = TRUE) %>% head(10)
-
 
 ```
 
@@ -259,13 +282,20 @@ This helps keep the table tidy before we later combine GBIF with NBN and screen 
 ```{r}
 # Purpose: light within-source de-duplication before later cross-source merging
 
-n_before <- nrow(gbif_clean)
+if (exists("gbif_raw")) {
 
-gbif_clean <- gbif_clean %>%
-  distinct(gbifID, .keep_all = TRUE) %>%
-  distinct(lon, lat, date, .keep_all = TRUE)
+  n_before <- nrow(gbif_clean)
 
-message("GBIF rows (screened -> de-dup): ", n_before, " -> ", nrow(gbif_clean))
+  gbif_clean <- gbif_clean %>%
+    distinct(gbifID, .keep_all = TRUE) %>%
+    distinct(lon, lat, date, .keep_all = TRUE)
+
+  message("GBIF rows (screened -> de-dup): ", n_before, " -> ", nrow(gbif_clean))
+
+} else {
+
+  message("Skipping GBIF de-dup (cached gbif_clean already reflects previous de-duplication).")
+}
 
 ```
 ## Save output
@@ -276,7 +306,13 @@ We save the screened, de-duplicated GBIF table so we can reuse it without re-pul
 # Purpose: save clean GBIF table for reuse
 gbif_outfile <- file.path(gbif_out_dir, paste0("gbif_", slug, "_clean.csv"))
 
-write_csv(gbif_clean, gbif_outfile)
+if (!file.exists(gbif_outfile)) {
+  write_csv(gbif_clean, gbif_outfile)
+  message("Saved GBIF clean file: ", gbif_outfile)
+} else {
+  message("GBIF clean file already exists (left unchanged): ", gbif_outfile)
+}
+
 gbif_outfile
 
 ```
@@ -298,7 +334,7 @@ At this point we have:
 ```{r}
 library(galah)
 
-# NBN access: use the email associated with your atlas account
+# NBN access: use the email associated with my atlas account
 nbn_email <- "jamesrimmer92@mail.com"
 
 # Accepted licences (NBN tends to return short codes like CC-BY, CC0, etc.)
@@ -310,7 +346,7 @@ nbn_ckpt_dir <- file.path(ckpt_root, "nbn")
 
 # Configure galah to use the UK atlas + provide a download reason
 galah_config(atlas = "United Kingdom", email = nbn_email, verbose = FALSE)
-galah_config(download_reason_id = 17) # 17 = research/academic purposes (as per your earlier working setup)
+galah_config(download_reason_id = 17) # 17 = research/academic purposes
 ```
 
 ## NBN taxon check
@@ -495,7 +531,39 @@ At this point we have two screened and within-source de-duplicated tables:
 - `gbif_clean` (GBIF, Europe-wide)
 - `nbn_clean` (NBN Atlas, UK-only)
 
-The next step is to combine these into a single table and check for records that may be present in both sources. There is no shared universal record ID between GBIF and NBN, so the safest cross-source duplicate check has to be approximate.
+There is no shared record ID between GBIF and NBN, so cross-source duplicate checking has to be approximate.
+For this test we use:
+
+- `species`
+- *rounded coordinates* (to reduce tiny numerical differences between sources)
+- `date`, when a full calendar day is available
+
+We only automatically remove duplicates where the match is very clear (a simple one-to-one match between sources). Anything more complicated is kept and flagged for review.
+
+### Reloading clean outputs (if data are already there)
+
+Run the chunk below if on a fresh device (ensure the data are already in the correct folders)
+
+```{r}
+gbif_outfile <- file.path(gbif_out_dir, paste0("gbif_", slug, "_clean.csv"))
+nbn_outfile  <- file.path(nbn_out_dir,  paste0("nbn_",  slug, "_clean.csv"))
+
+if (!file.exists(gbif_outfile)) {
+  stop("Can't find GBIF clean file at: ", gbif_outfile,
+       "\nHave you run the GBIF section and saved the output?")
+}
+if (!file.exists(nbn_outfile)) {
+  stop("Can't find NBN clean file at: ", nbn_outfile,
+       "\nHave you run the NBN section and saved the output?")
+}
+
+gbif_clean <- readr::read_csv(gbif_outfile, show_col_types = FALSE)
+nbn_clean  <- readr::read_csv(nbn_outfile,  show_col_types = FALSE)
+
+message("Reloaded:")
+message(" - GBIF: ", gbif_outfile, " (", nrow(gbif_clean), " rows)")
+message(" - NBN : ", nbn_outfile,  " (", nrow(nbn_clean),  " rows)")
+```
 
 ### Checking for duplicates 
 
@@ -516,7 +584,7 @@ The next step is to combine these into a single table and check for records that
 - Anything messier than that is kept, but clearly flagged and printed so I can sanity check it. 
 
 ```{r}
-# Purpose: stop early if the expected cleaned tables are not present
+# Purpose: stop early if the expected cleaned tables are not present (run section above first and earlier)
 if (!exists("gbif_clean")) stop("gbif_clean not found - run the GBIF section first.")
 if (!exists("nbn_clean")) stop("nbn_clean not found - run the NBN section first.")
 ```
@@ -525,270 +593,315 @@ if (!exists("nbn_clean")) stop("nbn_clean not found - run the NBN section first.
 
 We standardise column names so GBIF and NBN can be bound row-wise cleanly, while still keeping traceability back to each source.
 
-```{r}
-# Purpose: standardise GBIF and NBN into the same column set for merging
+```{r merge_prep, echo=FALSE, message=FALSE, warning=FALSE, results="hide"}
+# ---- Merge + cross-source duplicate checks (tidy outputs) ----
 
-gbif_merge <- gbif_clean %>%
+# Choose which source "wins" when we have a clean 1-to-1 match on the same day + location.
+# (Keeping GBIF by default, because it already covers the full Europe scope.)
+prefer_source <- "GBIF"  # or "NBN"
+
+# 1) Standardise columns so GBIF + NBN can be row-bound cleanly
+occ_gbif <- gbif_clean %>%
   transmute(
-    source = source,                      # "GBIF"
-    species = species,
-    record_id = as.character(gbifID),     # source-specific unique ID (GBIF ID)
+    source,
+    species,
+    record_id    = as.character(gbifID),      # <- force to character
     occurrenceID = as.character(occurrenceID),
-    lon = lon,
-    lat = lat,
-    date_raw = as.character(date),        # keep raw date string exactly as supplied
-    year = as.integer(year),
-    country = as.character(country),
-    licence_raw = as.character(licence_raw),
-    licence = as.character(licence)
+    lon, lat,
+    date_raw     = as.character(date),
+    year         = as.integer(year),
+    country      = as.character(country),
+    licence_raw  = as.character(licence_raw),
+    licence      = as.character(licence)
   )
 
-nbn_merge <- nbn_clean %>%
+occ_nbn <- nbn_clean %>%
   transmute(
-    source = source,                      # "NBN"
-    species = species,
-    record_id = as.character(recordID),   # source-specific unique ID (NBN recordID)
-    occurrenceID = NA_character_,         # not available for NBN in our pull (could change this)
-    lon = lon,
-    lat = lat,
-    date_raw = as.character(date),        # NBN dates are usually already day-level
-    year = as.integer(year),
-    country = "GB",                       # NBN Atlas is UK-only; set a consistent country label for merging
-    licence_raw = as.character(licence_raw),
-    licence = as.character(licence)
+    source,
+    species,
+    record_id    = as.character(recordID),    
+    occurrenceID = NA_character_,
+    lon, lat,
+    date_raw     = as.character(date),
+    year         = as.integer(year),
+    country      = "GB",
+    licence_raw  = as.character(licence_raw),
+    licence      = as.character(licence)
   )
 
-# Combine into one table (still contains duplicates, if any)
-occ_all <- bind_rows(gbif_merge, nbn_merge)
+occ_merged_all <- bind_rows(occ_gbif, occ_nbn)
 
-message("Rows before merge: GBIF=", nrow(gbif_merge), " | NBN=", nrow(nbn_merge))
-message("Rows after merge (no cross-source de-duplicating yet): ", nrow(occ_all))
-```
-
-## Derive date precision and create duplicate-check keys
-
-GBIF `eventDate` is not always a single day, so we only treat a date as “day-level” if it clearly starts with `YYYY-MM-DD` and is not a range (e.g. contains `/`).
-
-We also round coordinates to a fixed number of decimal places so small differences don’t prevent matching. This is a judgement call: tighter rounding = fewer false matches but more missed duplicates; looser rounding = more matches but greater risk of collapsing genuinely distinct points.
-
-```{r}
-# Purpose: create strict (day-level) and loose (year-level) matching keys
-
-coord_round_dp <- 4  # 4 dp ~ ~10 m; increase to be stricter, decrease to be more tolerant
-
-occ_all <- occ_all %>%
+# 2) Parse date precision + build match keys
+#    - "day" precision: yyyy-mm-dd parseable (not a range)
+#    - "year" precision: year exists but no clean day
+#    - "unknown": neither is reliable
+occ_merged_all <- occ_merged_all %>%
   mutate(
-    # Round lon/lat and format as fixed-width strings for stable key construction
-    lon_key = if_else(is.na(lon), NA_character_,
-                      sprintf(paste0("%.", coord_round_dp, "f"), round(lon, coord_round_dp))),
-    lat_key = if_else(is.na(lat), NA_character_,
-                      sprintf(paste0("%.", coord_round_dp, "f"), round(lat, coord_round_dp))),
-
-    # Identify obvious date ranges (GBIF sometimes returns intervals like "2015-01-01/2015-12-31")
-    date_is_range = !is.na(date_raw) & str_detect(date_raw, "/"),
-
-    # Extract a day string only when it looks like an ISO day and isn't a range
-    date_day_str = if_else(
-      !is.na(date_raw) & !date_is_range & str_detect(date_raw, "^\\d{4}-\\d{2}-\\d{2}"),
-      substr(date_raw, 1, 10),
-      NA_character_
-    ),
-
-    # Parse to Date (quiet=TRUE avoids warnings for odd strings; returns NA if it can't parse)
-    date_day = lubridate::ymd(date_day_str, quiet = TRUE),
-
-    # Track what precision we actually have available
-    date_precision = case_when(
-      !is.na(date_day) ~ "day",
+    date_is_range = !is.na(date_raw) & stringr::str_detect(date_raw, "/"),
+    date_day_str  = dplyr::if_else(!is.na(date_raw), stringr::str_sub(date_raw, 1, 10), NA_character_),
+    date_day      = suppressWarnings(lubridate::ymd(date_day_str)),
+    date_precision = dplyr::case_when(
+      !is.na(date_day) & !date_is_range ~ "day",
       !is.na(year) ~ "year",
       TRUE ~ "unknown"
     ),
 
-    # Strict key: same species + rounded coords + same day (only when day is available)
-    key_day = if_else(
+    # coordinate keys (4 dp ~ ~11 m; conservative but usually fine for this purpose)
+    lon_key = round(lon, 4),
+    lat_key = round(lat, 4),
+
+    # strict day key: species + rounded coords + exact day
+    key_day = dplyr::if_else(
       date_precision == "day",
-      paste(species, lon_key, lat_key, as.character(date_day), sep = "|"),
+      paste0(species, "|", sprintf("%.4f", lon_key), "|", sprintf("%.4f", lat_key), "|", as.character(date_day)),
       NA_character_
     ),
 
-    # Loose key: same species + rounded coords + same year (used for flagging only)
-    key_year = if_else(
+    # loose year key: species + rounded coords + year (used only for flagging)
+    key_year = dplyr::if_else(
       !is.na(year),
-      paste(species, lon_key, lat_key, as.character(year), sep = "|"),
+      paste0(species, "|", sprintf("%.4f", lon_key), "|", sprintf("%.4f", lat_key), "|", year),
       NA_character_
     )
   )
-
-# Quick check: what date precision do we actually have by source?
-occ_all %>%
-  count(source, date_precision, sort = TRUE) %>%
-  print(n = Inf)
 ```
 
-## Cross-source duplicate check (strict day-level)
 
-This identifies candidate duplicates where both sources have at least one record with the same strict day-level key.
-
-These are the strongest candidates for “same observation listed twice”, but they are not guaranteed duplicates.
-
-```{r}
-# Purpose: find strict cross-source duplicate groups (same day + rounded coords)
-
-dup_day_groups <- occ_all %>%
-  filter(!is.na(key_day)) %>%                 # strict matching only possible when a day-level date exists
+```{r merge_logic, echo=FALSE, message=FALSE, warning=FALSE, results="hide"}
+# 3) Flag potential cross-source duplicates
+day_key_summary <- occ_merged_all %>%
+  filter(!is.na(key_day)) %>%
   group_by(key_day) %>%
   summarise(
     n_total = n(),
-    n_gbif = sum(source == "GBIF"),
-    n_nbn  = sum(source == "NBN"),
+    n_gbif  = sum(source == "GBIF"),
+    n_nbn   = sum(source == "NBN"),
     .groups = "drop"
   ) %>%
-  filter(n_gbif > 0 & n_nbn > 0) %>%          # must appear in both sources
-  arrange(desc(n_total))
+  mutate(has_both_sources = (n_gbif > 0 & n_nbn > 0))
 
-message("Strict cross-source duplicate groups (day-level): ", nrow(dup_day_groups))
-message("Strict cross-source duplicate records involved (day-level): ", sum(dup_day_groups$n_total))
+keys_day_both <- day_key_summary %>%
+  filter(has_both_sources) %>%
+  pull(key_day)
 
-# Distribution of group sizes (helpful to spot messy cases where rounding may be too loose)
-dup_day_groups %>%
-  count(n_total, sort = TRUE) %>%
-  print(n = Inf)
-
-# Show a small sample of candidate duplicates for sanity checking
-if (nrow(dup_day_groups) > 0) {
-  example_keys <- head(dup_day_groups$key_day, 3)
-
-  occ_all %>%
-    filter(key_day %in% example_keys) %>%
-    arrange(key_day, source) %>%
-    select(source, record_id, occurrenceID, lon, lat, date_raw, date_day, year, country, licence) %>%
-    print(n = Inf)
-}
-```
-
-## Cross-source duplicate check (loose year-level only)
-
-This flags cases where both sources have records in the same rounded location and year, but at least one record lacks a usable day-level date. These are possible duplicates, but are much less certain, so we do not remove them automatically.
-
-```{r}
-# Purpose: flag loose cross-source duplicates (same year + rounded coords), used for review only
-
-dup_year_loose_groups <- occ_all %>%
+# Year-level "loose" flags: only when the year key matches across sources AND at least one record lacks day precision
+year_key_summary <- occ_merged_all %>%
   filter(!is.na(key_year)) %>%
   group_by(key_year) %>%
   summarise(
     n_total = n(),
-    n_gbif = sum(source == "GBIF"),
-    n_nbn  = sum(source == "NBN"),
-    any_not_day = any(date_precision != "day"),  # at least one record only has year/unknown precision
+    n_gbif  = sum(source == "GBIF"),
+    n_nbn   = sum(source == "NBN"),
+    n_not_day = sum(date_precision != "day"),
     .groups = "drop"
   ) %>%
-  filter(n_gbif > 0 & n_nbn > 0 & any_not_day) %>%
-  arrange(desc(n_total))
+  mutate(flag_loose = (n_gbif > 0 & n_nbn > 0 & n_not_day > 0))
 
-message("Loose cross-source duplicate groups (year-level, at least one record not day-precise): ", nrow(dup_year_loose_groups))
+keys_year_loose <- year_key_summary %>%
+  filter(flag_loose) %>%
+  pull(key_year)
 
-# Show a small sample for inspection (these are the ones most likely to be ambiguous)
-if (nrow(dup_year_loose_groups) > 0) {
-  example_keys <- head(dup_year_loose_groups$key_year, 3)
-
-  occ_all %>%
-    filter(key_year %in% example_keys) %>%
-    arrange(key_year, source) %>%
-    select(source, record_id, occurrenceID, lon, lat, date_raw, date_precision, year, country, licence) %>%
-    print(n = Inf)
-}
-```
-
-## Build merged outputs and apply conservative cross-source de-duplication
-
-Here we produce two outputs:
-
-1) `occ_merged_all`  
-   Everything combined, with flags showing which records are part of strict/loose cross-source duplicate groups.
-
-2) `occ_merged_dedup_strict`  
-   A conservative de-duplicated version where we remove only clear one-to-one strict duplicates.
-
-**Important:** We only drop records for strict groups that are exactly one GBIF + one NBN record. If a group is larger than that, it stays in the data and is flagged for review (because rounding could be collapsing nearby-but-distinct points, or there could be multiple genuine observations).
-
-```{r}
-# Purpose: flag duplicates and create a conservative de-duplicated table
-
-# Mark strict day-level duplicate membership
-strict_keys <- dup_day_groups$key_day
-
-# Mark loose year-level duplicate membership
-loose_year_keys <- dup_year_loose_groups$key_year
-
-occ_merged_all <- occ_all %>%
+occ_merged_all <- occ_merged_all %>%
   mutate(
-    cross_dup_day = !is.na(key_day) & key_day %in% strict_keys,
-    cross_dup_year_loose = !is.na(key_year) & key_year %in% loose_year_keys
+    cross_dup_day        = !is.na(key_day)  & key_day  %in% keys_day_both,
+    cross_dup_year_loose = !is.na(key_year) & key_year %in% keys_year_loose
   )
 
-# Identify strictly one-to-one groups only (the safest automatic de-duplicate case)
-one_to_one_keys <- dup_day_groups %>%
-  filter(n_total == 2 & n_gbif == 1 & n_nbn == 1) %>%
+# 4) Decide what we drop (conservative rule)
+#    We only auto-drop 1-to-1 day matches (exactly one GBIF + one NBN record in the same key_day).
+one_to_one_day_keys <- day_key_summary %>%
+  filter(has_both_sources, n_total == 2, n_gbif == 1, n_nbn == 1) %>%
   pull(key_day)
 
-message("Strict one-to-one duplicate groups (safe auto de-duplicate): ", length(one_to_one_keys))
+dropped_strict <- occ_merged_all %>%
+  filter(key_day %in% one_to_one_day_keys, source != prefer_source) %>%
+  mutate(drop_reason = paste0("Strict 1-to-1 day match; kept ", prefer_source))
 
-# Conservative de-duplicate rule:
-# - For one-to-one strict duplicates, keep the GBIF record and drop the NBN record
-#   (this is arbitrary; we could flip the condition below)
 occ_merged_dedup_strict <- occ_merged_all %>%
-  mutate(
-    drop = !is.na(key_day) & key_day %in% one_to_one_keys & source == "NBN"
+  filter(!(key_day %in% one_to_one_day_keys & source != prefer_source))
+
+# 5) A “review” table for anything more complicated than 1-to-1
+occ_crossdup_review <- occ_merged_all %>%
+  filter(cross_dup_day) %>%
+  group_by(key_day) %>%
+  filter(!(n() == 2 & sum(source == "GBIF") == 1 & sum(source == "NBN") == 1)) %>%
+  ungroup() %>%
+  arrange(desc(key_day), source)
+```
+
+## Summary tables 
+
+```{r merge_report, echo=FALSE, message=FALSE, warning=FALSE}
+cat("\n=== Inputs ===\n")
+print(
+  tibble::tibble(
+    dataset = c("GBIF (clean)", "NBN (clean)"),
+    rows    = c(nrow(gbif_clean), nrow(nbn_clean))
+  )
+)
+
+cat("\n=== Merged totals ===\n")
+print(
+  tibble::tibble(
+    stage = c("Merged (all)", "Merged (after strict dedup)"),
+    rows  = c(nrow(occ_merged_all), nrow(occ_merged_dedup_strict))
+  )
+)
+
+cat("\n=== Date precision by source ===\n")
+occ_merged_all %>%
+  count(source, date_precision, sort = TRUE) %>%
+  print(n = Inf)
+
+cat("\n=== Cross-source duplicate flags (how many records are involved) ===\n")
+occ_merged_all %>%
+  summarise(
+    n_total = n(),
+    n_cross_dup_day = sum(cross_dup_day, na.rm = TRUE),
+    n_cross_dup_year_loose = sum(cross_dup_year_loose, na.rm = TRUE),
+    prop_cross_dup_day = n_cross_dup_day / n_total,
+    prop_cross_dup_year_loose = n_cross_dup_year_loose / n_total
   ) %>%
-  filter(!drop) %>%
-  select(-drop)
+  print()
 
-message("Rows in merged (all):          ", nrow(occ_merged_all))
-message("Rows in merged (dedup strict): ", nrow(occ_merged_dedup_strict))
-message("Rows dropped by strict de-dup: ", nrow(occ_merged_all) - nrow(occ_merged_dedup_strict))
+cat("\n=== What got auto-dropped under the strict rule ===\n")
+print(tibble::tibble(
+  prefer_source = prefer_source,
+  dropped_rows  = nrow(dropped_strict),
+  dropped_prop_of_merged = nrow(dropped_strict) / nrow(occ_merged_all),
+  remaining_rows = nrow(occ_merged_dedup_strict)
+))
 
-# Safety check: show any strict duplicate groups that are NOT one-to-one (these are left in place intentionally)
-dup_day_risky <- dup_day_groups %>%
-  filter(!(n_total == 2 & n_gbif == 1 & n_nbn == 1))
+if (nrow(dropped_strict) > 0) {
+  cat("\nDropped rows by source/date precision:\n")
+  dropped_strict %>% count(source, date_precision, sort = TRUE) %>% print(n = Inf)
 
-message("Strict cross-source groups retained for review (not one-to-one): ", nrow(dup_day_risky))
+  cat("\nDropped rows by licence:\n")
+  dropped_strict %>% count(licence, sort = TRUE) %>% print(n = Inf)
 
-if (nrow(dup_day_risky) > 0) {
-  print(head(dup_day_risky, 10), n = Inf)
+  cat("\nTop years in dropped rows:\n")
+  dropped_strict %>% count(year, sort = TRUE) %>% head(15) %>% print(n = Inf)
+}
+
+cat("\n=== Duplicate group structure (strict day keys) ===\n")
+day_key_summary %>%
+  filter(has_both_sources) %>%
+  count(n_total, sort = TRUE) %>%
+  print(n = Inf)
+
+cat("\nAmbiguous cross-source groups kept for review: ",
+    n_distinct(occ_crossdup_review$key_day), " keys (",
+    nrow(occ_crossdup_review), " rows)\n", sep = "")
+```
+
+```{r merge_examples, echo=FALSE, message=FALSE, warning=FALSE}
+cat("### Examples of ambiguous cross-source groups (kept)\n\n")
+
+example_keys <- occ_crossdup_review %>%
+  distinct(key_day) %>%
+  head(3) %>%
+  pull(key_day)
+
+if (length(example_keys) == 0) {
+  cat("No ambiguous groups in this run (all strict day matches were 1-to-1).\n")
+} else {
+  ex_tbl <- occ_crossdup_review %>%
+    filter(key_day %in% example_keys) %>%
+    select(key_day, source, record_id, occurrenceID, lon, lat, date_raw, date_precision, year, licence) %>%
+    arrange(key_day, source)
+
+  knitr::kable(ex_tbl)
 }
 ```
 
-## Save merged outputs
+## What we removed in this test run (and at what resolution)
 
-We save both versions so we can decide later whether to use the conservative de-duplicated table, or work from the “all records” version with duplicate flags.
+This is a workflow test for a single species (*Vespula vulgaris*) to confirm we can pull, standardise, and merge occurrence data from **GBIF** and the **NBN Atlas** without obvious double-counting, while keeping the matching rules conservative and easy to explain.
 
-```{r}
-# Purpose: save merged tables (all + conservative strict de-dup)
+### A) Source-specific screening (before any de-duplication)
 
-merge_out_dir <- file.path("..", "data", "processed", "merged", "wasps")
-dir.create(merge_out_dir, recursive = TRUE, showWarnings = FALSE)
+For both sources we keep only records that meet two basic requirements:
 
-merged_all_outfile <- file.path(merge_out_dir, paste0("merged_gbif_nbn_", slug, "_all.csv"))
-merged_dedup_outfile <- file.path(merge_out_dir, paste0("merged_gbif_nbn_", slug, "_dedup_strict.csv"))
+- **Coordinates present:** `lon` and `lat` are not missing.
+- **Acceptable licence:** GBIF licences are restricted to `allowed_licences` (CC0/CC-BY/CC-BY-NC) and NBN licences to `allowed_licences_nbn` (OGL/CC0/CC-BY/CC-BY-NC).
 
-write_csv(occ_merged_all, merged_all_outfile)
-write_csv(occ_merged_dedup_strict, merged_dedup_outfile)
+In this test run:
 
-merged_all_outfile
-merged_dedup_outfile
-```
+- GBIF (raw-with-coordinates, Europe scope) started at **62,421** records and all were within the accepted GBIF licence set in this run.
+- NBN (screened UK-only pull) produced **11,682** records after coordinate + licence screening.
 
-## Merge summary
+### B) Within-source de-duplication (exact matches only)
 
-At this point we have:
-- a combined GBIF+NBN table (`occ_merged_all`) with flags for potential cross-source duplicates
-- a conservative de-duplicated version (`occ_merged_dedup_strict`) where only one-to-one strict duplicates are removed
-- printed summaries showing:
-  - how many strict day-level duplicate groups exist
-  - whether any groups look “messy” (which can indicate coordinate rounding is too loose, or dense repeated records)
+Before combining sources, we remove **exact repeats within each dataset**. This is intentionally light-touch: it does not try to collapse “near-duplicates”.
 
-The loose year-level duplicate groups are retained and only flagged, because they are much more likely to be ambiguous.
+GBIF (`gbif_clean`):
 
+- Step 1: remove duplicate `gbifID` (exact same GBIF record repeated).
+  - **Resolution:** exact match on `gbifID`.
+- Step 2: remove exact repeats of `(lon, lat, date)` after screening.
+  - **Resolution:** exact equality on `lon`, exact equality on `lat`, and exact string equality on `date` (as stored in `gbif_clean$date`).
 
+Net effect:
 
+- GBIF: **62,421 → 56,323** (so **6,098** GBIF records were dropped as within-source duplicates).
+
+NBN (`nbn_clean`):
+
+- Step 1: remove duplicate `recordID`.
+  - **Resolution:** exact match on `recordID`.
+- Step 2: remove exact repeats of `(lon, lat, date)`.
+  - **Resolution:** exact equality on `lon`, exact equality on `lat`, and exact equality on `date` (as stored in `nbn_clean$date`).
+
+Net effect:
+
+- NBN: **11,682 → 11,682** (no within-source duplicates removed in this run).
+
+### C) Cross-source duplicate handling (GBIF vs NBN; approximate matching)
+
+GBIF and NBN do not share a universal record identifier, so cross-source duplicate detection must be approximate. We construct matching keys in `occ_merged_all` and use them to *flag* possible duplicates; we only *drop* records in the simplest and safest case.
+
+Strict “day-level” duplicate key (used for auto-drop when one-to-one):
+
+- **Species:** exact match on `species` (here, always the test species).
+- **Location:** coordinates rounded to **4 decimal places**:
+  - `lon_key = round(lon, 4)`
+  - `lat_key = round(lat, 4)`
+  - (4 dp is ~10–11 m at UK latitudes; exact metres vary slightly with latitude.)
+- **Date:** must have an unambiguous day:
+  - `date_day_str = substr(date_raw, 1, 10)`
+  - `date_day = ymd(date_day_str)` must succeed
+  - date must **not** be a range (we treat `"YYYY-MM-DD/YYYY-MM-DD"` as a range and do not use it as a strict day key)
+
+This builds `key_day` of the form:
+
+- `species|<lon_4dp>|<lat_4dp>|<YYYY-MM-DD>`
+
+Loose “year-level” key (used only for flagging; never auto-dropped):
+
+- Same `species` and same rounded coordinates (4 dp), but match on `year` only:
+  - `key_year = species|<lon_4dp>|<lat_4dp>|<YYYY>`
+
+**What we automatically remove (conservative rule):**
+
+- We only auto-drop records where the strict `key_day` produces a clean **one-to-one** match:
+  - exactly **1 GBIF** record and exactly **1 NBN** record share the same `key_day`.
+- In that case we keep the record from the preferred source (`prefer_source`, set to `"GBIF"` in this run) and drop the other record (the NBN one) to avoid double-counting.
+
+**What we do not automatically remove:**
+
+- Any “messy” clusters (e.g., 3+ records sharing the same `key_day`, or multiple GBIF and/or multiple NBN records sharing a key) are **not dropped**. They are retained and flagged for review in `occ_crossdup_review` because they could be:
+  - genuine repeated observations (multiple observers, repeated sampling), or
+  - artefacts of rounding being too coarse in dense datasets.
+
+Net effect in this test run:
+
+- Inputs: GBIF clean **56,323** (`gbif_clean`), NBN clean **11,682** (`nbn_clean`)
+- Merged total (pre cross-source de-dup): **68,005** (`occ_merged_all`)
+- Auto-dropped as strict one-to-one duplicates: **10,060** records (all were NBN day-level records)
+  - these were removed because they matched GBIF on the strict `key_day` (same species, same rounded location to 4 dp, same parsed calendar day)
+- Merged after strict de-dup: **57,945** (`occ_merged_dedup_strict`)
+
+Practical interpretation for this species:
+
+- A large fraction of NBN day-level records appear to be duplicates of GBIF under the conservative matching rule.
+- We are deliberately conservative: we only delete where the duplication signal is strongest (one-to-one day matches), and we keep ambiguous clusters for review rather than risk deleting true observations.
