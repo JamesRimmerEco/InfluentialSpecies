@@ -20,6 +20,10 @@ data/checkpoints/**
 data/raw/checkpoints/**
 !data/raw/checkpoints/**/.gitkeep
 
+# Licence flag logs (only created when unexpected licences appear)
+data/raw/licence_flags/**
+!data/raw/licence_flags/**/.gitkeep
+
 # Rendered reports / misc outputs 
 *.html
 *.docx
