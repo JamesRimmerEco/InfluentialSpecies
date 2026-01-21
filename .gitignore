@@ -38,3 +38,10 @@ data/raw/licence_flags/**
 *.tar.gz
 *.rds
 *.RData
+
+# GBIF credentials
+# Credentials are required to download from species with more than 100,000 entries.
+# As such, a script is created containing my credentials, but these are not syned to GitHub. 
+data/credentials.R
+
+

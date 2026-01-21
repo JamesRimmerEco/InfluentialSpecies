@@ -19,29 +19,6 @@
 #     data/_checkpoints/gbif/gbif_pull_checkpoint_<slug>.rds
 #     data/_checkpoints/nbn/nbn_pull_checkpoint_<slug>.rds
 #
-# How GBIF pulls work (important):
-#   - GBIF "search" (occ_search) is hard-limited to 100,000 records per query.
-#   - This script checks the expected GBIF record count per species:
-#       * If <= 100,000: it uses occ_search paging and writes the CSV immediately.
-#       * If > 100,000: it uses GBIF downloads (occ_download), which are asynchronous.
-#   - For >100k species, the first run typically:
-#       * submits a download job to GBIF,
-#       * saves the download key in the checkpoint,
-#       * skips to the next species (so the whole run doesn't stall),
-#       * prints a final warning listing any species still pending.
-#   - When you run the same pull script again later, it automatically:
-#       * reads the saved download key from the checkpoint,
-#       * checks whether the download has finished,
-#       * fetches/unzips/cleans the data once ready, and writes the final CSV.
-#   - Once a species is complete (CSV exists AND checkpoint is marked complete),
-#     re-running does NOT re-download or re-pull that species; it is treated as cached.
-#
-# Typical usage:
-#   - You usually run this via a wrapper script in /scripts/ (e.g. pull_raw_species_set_*.R)
-#   - If no species exceed 100k, one run is enough.
-#   - If any species exceed 100k, you may need to re-run the wrapper script one or more
-#     times until the final "GBIF WARNING" list disappears (all downloads completed).
-#
 # QA / certainty fields included in the "raw clean" outputs (NEW):
 #   GBIF:
 #     - coordinateUncertaintyInMeters
@@ -61,15 +38,14 @@
 #   other licence types appear we:
 #     (i) flag this clearly to the console, and
 #     (ii) write a per-species log file under data/raw/licence_flags/
-#   These log files are only created when unexpected licence types are
+#   These log files are only created when unexpected licence types are 
 #   present (if there are none, this will never appear).
 #
 # Notes:
 #   - If cached *_clean.csv files were created before the QA fields were added,
 #     this script will automatically treat them as stale and re-pull (probably only
 #     will occur for wasps, or if we decide to add more columns).
-# ------------------------------------------------------------------------------ 
-
+# ------------------------------------------------------------------------------
 
 suppressPackageStartupMessages({
   library(dplyr)
@@ -80,36 +56,6 @@ suppressPackageStartupMessages({
   library(rgbif)
   library(galah)
 })
-
-# ---- Helper: load local (gitignored) credentials if present -------------------
-load_local_gbif_credentials <- function(repo_root) {
-  candidates <- c(
-    file.path(repo_root, "credentials.R"),
-    file.path(repo_root, "data", "credentials.R")
-  )
-  
-  existing <- candidates[file.exists(candidates)]
-  if (length(existing) == 0) return(invisible(FALSE))
-  cred_file <- existing[1]
-  
-  cred_env <- new.env(parent = baseenv())
-  sys.source(cred_file, envir = cred_env)
-  
-  if (exists("GBIF_USER", envir = cred_env, inherits = FALSE) &&
-      exists("GBIF_PWD",  envir = cred_env, inherits = FALSE) &&
-      exists("GBIF_EMAIL",envir = cred_env, inherits = FALSE)) {
-    
-    Sys.setenv(
-      GBIF_USER  = get("GBIF_USER",  envir = cred_env, inherits = FALSE),
-      GBIF_PWD   = get("GBIF_PWD",   envir = cred_env, inherits = FALSE),
-      GBIF_EMAIL = get("GBIF_EMAIL", envir = cred_env, inherits = FALSE)
-    )
-    return(invisible(TRUE))
-  }
-  
-  warning("Found credentials file but it did not define GBIF_USER / GBIF_PWD / GBIF_EMAIL.")
-  invisible(FALSE)
-}
 
 # ---- Helper: find repo root robustly -----------------------------------------
 get_repo_root <- function() {
@@ -126,9 +72,6 @@ get_repo_root <- function() {
     "Set your working directory to the project root (InfluentialSpecies) and try again."
   )
 }
-
-repo_root <- get_repo_root()
-load_local_gbif_credentials(repo_root)
 
 # ---- Helper: slugify a species name ------------------------------------------
 slugify_species <- function(species_name) {
@@ -171,13 +114,7 @@ pull_gbif_clean <- function(species_name,
                             max_records = Inf,
                             expected_licences_gbif = c("CC0_1_0", "CC_BY_4_0", "CC_BY_NC_4_0"),
                             use_cache = TRUE,
-                            species_subdir = TRUE,
-                            gbif_method = c("auto", "search", "download"),
-                            gbif_download_wait = FALSE,
-                            gbif_search_hard_limit = 100000L,
-                            gbif_user = Sys.getenv("GBIF_USER"),
-                            gbif_pwd = Sys.getenv("GBIF_PWD"),
-                            gbif_email = Sys.getenv("GBIF_EMAIL")) {
+                            species_subdir = TRUE) {
   
   repo_root <- get_repo_root()
   slug <- slugify_species(species_name)
@@ -190,15 +127,12 @@ pull_gbif_clean <- function(species_name,
   dir.create(gbif_out_root, recursive = TRUE, showWarnings = FALSE)
   dir.create(gbif_ckpt_dir, recursive = TRUE, showWarnings = FALSE)
   
-  # Species subfolder
+  # Species subfolder (NEW)
   gbif_out_dir <- if (isTRUE(species_subdir)) file.path(gbif_out_root, slug) else gbif_out_root
   dir.create(gbif_out_dir, recursive = TRUE, showWarnings = FALSE)
   
   # Clean output file (used as a cache when re-running)
   gbif_outfile <- file.path(gbif_out_dir, paste0("gbif_", slug, "_clean.csv"))
-  
-  # Checkpoint file (also stores download keys + completion state)
-  ckpt_file <- file.path(gbif_ckpt_dir, paste0("gbif_pull_checkpoint_", slug, ".rds"))
   
   # Licence normaliser (GBIF uses URLs with 'licenses' in the path)
   lic_normalise_gbif <- function(x) {
@@ -217,49 +151,6 @@ pull_gbif_clean <- function(species_name,
     "issues"
   )
   
-  # Always return a tibble with the expected schema (even if 0 rows)
-  empty_gbif_clean <- function() {
-    tibble::tibble(
-      source = character(),
-      species = character(),
-      gbifID = character(),
-      occurrenceID = character(),
-      lon = numeric(),
-      lat = numeric(),
-      date = character(),
-      year = integer(),
-      country = character(),
-      licence_raw = character(),
-      licence = character(),
-      licence_expected = logical(),
-      coordinateUncertaintyInMeters = numeric(),
-      identificationVerificationStatus = character(),
-      issues = character(),
-      identifiedBy = character(),
-      dateIdentified = character()
-    )
-  }
-  
-  # Load / initialise checkpoint (backward compatible with older ckpt schema)
-  ckpt <- list(
-    schema_version = 2,
-    mode = NA_character_,          # "search" or "download"
-    complete = FALSE,              # TRUE only once we have a full dataset saved
-    total_expected = NA_integer_,
-    # search paging state
-    start = 0,
-    all_pages = list(),
-    # download state
-    download_key = NA_character_,
-    download_status = NA_character_,
-    last_updated = as.character(Sys.time())
-  )
-  
-  if (file.exists(ckpt_file)) {
-    old <- readRDS(ckpt_file)
-    ckpt <- utils::modifyList(ckpt, old)
-  }
-  
   # ---------------------------------------------------------------------------
   # GBIF taxon resolution
   # ---------------------------------------------------------------------------
@@ -268,9 +159,10 @@ pull_gbif_clean <- function(species_name,
   message("GBIF match: ", bb$scientificName, " (usageKey=", taxon_key, ", matchType=", bb$matchType, ")")
   
   # ---------------------------------------------------------------------------
-  # Cache check (only trusted as "complete" if checkpoint says complete=TRUE)
+  # GBIF occurrence pull (cached if available + schema matches)
   # ---------------------------------------------------------------------------
   use_cached <- isTRUE(use_cache) && file.exists(gbif_outfile)
+  
   if (use_cached) {
     gbif_cached <- readr::read_csv(gbif_outfile, show_col_types = FALSE)
     missing_cols <- setdiff(required_cache_cols, names(gbif_cached))
@@ -282,8 +174,9 @@ pull_gbif_clean <- function(species_name,
         "\nRe-pulling from GBIF: ", gbif_outfile
       )
       use_cached <- FALSE
-    } else if (isTRUE(ckpt$complete)) {
-      message("Found existing GBIF clean file + checkpoint marked complete; skipping API pull: ", gbif_outfile)
+    } else {
+      message("Found existing GBIF clean file; skipping API pull: ", gbif_outfile)
+      
       gbif_clean <- gbif_cached %>%
         mutate(
           licence = as.character(licence),
@@ -292,197 +185,94 @@ pull_gbif_clean <- function(species_name,
           identificationVerificationStatus = as.character(identificationVerificationStatus),
           issues = as.character(issues)
         )
-      attr(gbif_clean, "gbif_status") <- list(
-        state = "complete",
-        method = if (!is.null(ckpt$mode) && nzchar(ckpt$mode)) ckpt$mode else "unknown"
-      )
-      return(gbif_clean)
-    } else {
-      message("Found existing GBIF clean file, but checkpoint is not marked complete; verifying completeness...")
-      # We'll fall through and decide what to do based on record count + method
-      use_cached <- FALSE
     }
   }
   
-  # ---------------------------------------------------------------------------
-  # Decide method: search (<=100k) vs download (>100k)
-  #   - occ_search is capped at 100,000 records per query, so >100k requires downloads.
-  # ---------------------------------------------------------------------------
-  gbif_method <- match.arg(gbif_method)
-  
-  # Determine expected count (cheap; does not pull the data)
-  total_expected <- tryCatch(
-    rgbif::occ_count(
-      taxonKey = taxon_key,
-      continent = region_scope,
-      hasCoordinate = TRUE
-    ),
-    error = function(e) NA_integer_
-  )
-  
-  if (is.na(total_expected)) {
-    message("[GBIF] Warning: could not determine expected count (occ_count failed). Defaulting to method=", gbif_method)
-  } else {
-    message("[GBIF] Expected rows (query): ", total_expected)
-  }
-  
-  if (gbif_method == "auto") {
-    if (!is.na(total_expected) && total_expected > gbif_search_hard_limit) {
-      gbif_method <- "download"
-    } else {
-      gbif_method <- "search"
-    }
-  }
-  
-  # If user forced "search" but count suggests it will be capped, switch to download (to ensure full data).
-  if (gbif_method == "search" && !is.na(total_expected) && total_expected > gbif_search_hard_limit) {
-    message("[GBIF] Count exceeds ", gbif_search_hard_limit, ". occ_search() cannot retrieve >100k; switching to downloads.")
-    gbif_method <- "download"
-  }
-  
-  # Helper for safe credential check
-  have_gbif_creds <- function() {
-    nzchar(gbif_user) && nzchar(gbif_pwd) && nzchar(gbif_email)
-  }
-  
-  # ---------------------------------------------------------------------------
-  # DOWNLOAD path (unlimited, async) — submit now, resume on next run
-  # ---------------------------------------------------------------------------
-  if (gbif_method == "download") {
+  if (!use_cached) {
     
-    ckpt$mode <- "download"
-    ckpt$total_expected <- total_expected
-    ckpt$last_updated <- as.character(Sys.time())
-    saveRDS(ckpt, ckpt_file)
+    ckpt_file <- file.path(gbif_ckpt_dir, paste0("gbif_pull_checkpoint_", slug, ".rds"))
     
-    if (!have_gbif_creds()) {
-      message(
-        "\n[GBIF][INCOMPLETE] This species requires GBIF downloads (>100k expected), ",
-        "but GBIF credentials are not available in environment variables.\n",
-        "Set GBIF_USER, GBIF_PWD, GBIF_EMAIL (e.g., in ~/.Renviron), then re-run.\n"
-      )
-      gbif_clean <- empty_gbif_clean()
-      attr(gbif_clean, "gbif_status") <- list(state = "needs_credentials", method = "download", expected = total_expected)
-      return(gbif_clean)
-    }
+    max_retries <- 5
+    retry_base_wait_s <- 10
     
-    # If no key yet, submit a download and return (so the run can continue to other species)
-    if (is.null(ckpt$download_key) || is.na(ckpt$download_key) || !nzchar(ckpt$download_key)) {
-      dl <- rgbif::occ_download(
-        rgbif::pred_and(
-          rgbif::pred("taxonKey", taxon_key),
-          rgbif::pred("continent", region_scope),
-          rgbif::pred("hasCoordinate", TRUE)
-        ),
-        user = gbif_user, pwd = gbif_pwd, email = gbif_email
-      )
-      ckpt$download_key <- dl$key
-      ckpt$download_status <- "SUBMITTED"
-      ckpt$complete <- FALSE
-      ckpt$last_updated <- as.character(Sys.time())
-      saveRDS(ckpt, ckpt_file)
+    start <- 0
+    all_pages <- list()
+    total_expected <- NA_integer_
+    
+    # If a checkpoint exists, resume instead of starting from scratch
+    if (file.exists(ckpt_file)) {
+      ckpt <- readRDS(ckpt_file)
+      start <- ckpt$start
+      all_pages <- ckpt$all_pages
+      total_expected <- ckpt$total_expected
       
-      message(
-        "\n[GBIF] Download submitted for ", species_name, ".\n",
-        "  key: ", ckpt$download_key, "\n",
-        "  Status: SUBMITTED\n",
-        "Re-run the script later to resume and fetch the finished download.\n"
-      )
+      message("Resuming GBIF pull from start = ", start,
+              " (pages already stored: ", length(all_pages), ").")
+    }
+    
+    repeat {
+      Sys.sleep(pause_s)
       
-      gbif_clean <- empty_gbif_clean()
-      attr(gbif_clean, "gbif_status") <- list(state = "pending_download", method = "download", key = ckpt$download_key, expected = total_expected)
-      return(gbif_clean)
+      res <- NULL
+      for (attempt in seq_len(max_retries)) {
+        res <- tryCatch(
+          occ_search(
+            taxonKey = taxon_key,
+            continent = region_scope,
+            hasCoordinate = TRUE,
+            limit = page_size,
+            start = start
+          ),
+          error = function(e) e
+        )
+        
+        if (!inherits(res, "error")) break
+        
+        wait_s <- retry_base_wait_s * attempt
+        message("GBIF request failed at start = ", start,
+                " (attempt ", attempt, "/", max_retries, "): ",
+                conditionMessage(res),
+                " | waiting ", wait_s, "s then retrying...")
+        Sys.sleep(wait_s)
+      }
+      
+      if (inherits(res, "error")) {
+        saveRDS(list(start = start, all_pages = all_pages, total_expected = total_expected), ckpt_file)
+        stop(res)
+      }
+      
+      if (is.na(total_expected)) total_expected <- res$meta$count
+      if (length(res$data) == 0) break
+      
+      all_pages[[length(all_pages) + 1]] <- res$data
+      
+      saveRDS(list(start = start, all_pages = all_pages, total_expected = total_expected), ckpt_file)
+      
+      pulled_so_far <- start + nrow(res$data)
+      message("Pulled ", pulled_so_far, " / ", total_expected, " rows...")
+      
+      if (pulled_so_far >= total_expected) break
+      if (pulled_so_far >= max_records) {
+        message("Reached max_records safety limit (", max_records, ").")
+        break
+      }
+      
+      start <- start + nrow(res$data)
     }
     
-    # We have a download key — check status, optionally wait, then fetch
-    key <- ckpt$download_key
+    gbif_raw <- bind_rows(all_pages)
     
-    if (isTRUE(gbif_download_wait)) {
-      message("[GBIF] Waiting for download to finish (key=", key, ") ...")
-      rgbif::occ_download_wait(key, status_ping = 30, quiet = FALSE)
-    }
+    message("GBIF expected rows (query): ", total_expected)
+    message("GBIF rows pulled (paged):  ", nrow(gbif_raw))
     
-    meta <- tryCatch(rgbif::occ_download_meta(key), error = function(e) NULL)
-    status <- if (!is.null(meta) && !is.null(meta$status)) meta$status else NA_character_
-    ckpt$download_status <- status
-    ckpt$last_updated <- as.character(Sys.time())
-    saveRDS(ckpt, ckpt_file)
-    
-    if (is.na(status) || !identical(status, "SUCCEEDED")) {
-      message(
-        "\n[GBIF] Download not ready yet for ", species_name, " (key=", key, ", status=", status, ").\n",
-        "Skipping for now — re-run later to resume.\n"
-      )
-      gbif_clean <- empty_gbif_clean()
-      attr(gbif_clean, "gbif_status") <- list(state = "pending_download", method = "download", key = key, status = status, expected = total_expected)
-      return(gbif_clean)
-    }
-    
-    # Fetch zip
-    zip_path <- rgbif::occ_download_get(key, path = gbif_ckpt_dir, overwrite = TRUE)
-    if (is.list(zip_path) && "path" %in% names(zip_path)) zip_path <- zip_path$path
-    
-    tmpdir <- tempfile("gbif_dwc_")
-    dir.create(tmpdir)
-    utils::unzip(zip_path, exdir = tmpdir)
-    
-    occ_file <- list.files(
-      tmpdir,
-      pattern = "occurrence\\.(txt|csv)$",
-      recursive = TRUE,
-      full.names = TRUE,
-      ignore.case = TRUE
-    )[1]
-    
-    if (is.na(occ_file) || is.null(occ_file) || !file.exists(occ_file)) {
-      stop("GBIF download unzip succeeded but could not find occurrence.txt/csv inside: ", zip_path)
-    }
-    
-    message("[GBIF] Reading downloaded occurrence file: ", occ_file)
-    
-    # Read only needed columns (avoid loading huge extra fields)
-    needed_cols <- c(
-      "gbifID", "occurrenceID",
-      "decimalLongitude", "decimalLatitude",
-      "eventDate", "year", "countryCode",
-      "license",
-      "coordinateUncertaintyInMeters",
-      "identificationVerificationStatus",
-      "issues", "issue",
-      "identifiedBy", "dateIdentified"
-    )
-    
-    if (grepl("\\.csv$", occ_file, ignore.case = TRUE)) {
-      gbif_raw <- readr::read_csv(
-        occ_file,
-        show_col_types = FALSE,
-        progress = TRUE,
-        col_select = any_of(needed_cols)
-      )
-    } else {
-      gbif_raw <- readr::read_tsv(
-        occ_file,
-        show_col_types = FALSE,
-        progress = TRUE,
-        col_select = any_of(needed_cols)
-      )
-    }
-    
-    message("GBIF rows read from download file: ", nrow(gbif_raw))
-    
-    # Harmonise issues column name (download sometimes uses 'issue')
-    if (!"issues" %in% names(gbif_raw) && "issue" %in% names(gbif_raw)) {
-      gbif_raw$issues <- gbif_raw$issue
-    }
-    if (!"license" %in% names(gbif_raw)) gbif_raw$license <- NA_character_
-    if (!"coordinateUncertaintyInMeters" %in% names(gbif_raw)) gbif_raw$coordinateUncertaintyInMeters <- NA_real_
-    if (!"identificationVerificationStatus" %in% names(gbif_raw)) gbif_raw$identificationVerificationStatus <- NA_character_
-    if (!"issues" %in% names(gbif_raw)) gbif_raw$issues <- NA_character_
-    if (!"identifiedBy" %in% names(gbif_raw)) gbif_raw$identifiedBy <- NA_character_
-    if (!"dateIdentified" %in% names(gbif_raw)) gbif_raw$dateIdentified <- NA_character_
+    message("GBIF licence breakdown (RAW pull):")
+    gbif_raw %>%
+      count(license, sort = TRUE) %>%
+      mutate(prop = n / sum(n)) %>%
+      print(n = 10)
     
     # -------------------------------------------------------------------------
-    # Basic screening + essential fields (include QA/certainty fields)
+    # Basic screening + essential fields (UPDATED: include QA/certainty fields)
     # -------------------------------------------------------------------------
     gbif_clean <- gbif_raw %>%
       transmute(
@@ -503,255 +293,45 @@ pull_gbif_clean <- function(species_name,
           lic_normalise_gbif(license) %in% expected_licences_gbif,
         
         # QA / certainty fields
-        coordinateUncertaintyInMeters = as.numeric(coordinateUncertaintyInMeters),
-        identificationVerificationStatus = as.character(identificationVerificationStatus),
-        issues = as.character(issues),
-        identifiedBy = as.character(identifiedBy),
-        dateIdentified = as.character(dateIdentified)
+        coordinateUncertaintyInMeters = if ("coordinateUncertaintyInMeters" %in% names(gbif_raw)) {
+          as.numeric(coordinateUncertaintyInMeters)
+        } else NA_real_,
+        
+        identificationVerificationStatus = if ("identificationVerificationStatus" %in% names(gbif_raw)) {
+          as.character(identificationVerificationStatus)
+        } else NA_character_,
+        
+        issues = if ("issues" %in% names(gbif_raw)) {
+          as.character(issues)
+        } else NA_character_,
+        
+        identifiedBy = if ("identifiedBy" %in% names(gbif_raw)) {
+          as.character(identifiedBy)
+        } else NA_character_,
+        
+        dateIdentified = if ("dateIdentified" %in% names(gbif_raw)) {
+          as.character(dateIdentified)
+        } else NA_character_
       ) %>%
       filter(!is.na(lon), !is.na(lat))
     
-    message("GBIF rows (download -> screened coords only): ", nrow(gbif_raw), " -> ", nrow(gbif_clean))
+    message("GBIF rows (raw -> screened coords only): ", nrow(gbif_raw), " -> ", nrow(gbif_clean))
     
     # -------------------------------------------------------------------------
     # De-duplication (within GBIF; light-touch)
     # -------------------------------------------------------------------------
     n_before <- nrow(gbif_clean)
+    
     gbif_clean <- gbif_clean %>%
       distinct(gbifID, .keep_all = TRUE) %>%
       distinct(lon, lat, date, .keep_all = TRUE)
+    
     message("GBIF rows (screened -> de-dup): ", n_before, " -> ", nrow(gbif_clean))
     
     # Save output
     write_csv(gbif_clean, gbif_outfile)
     message("Saved GBIF clean file: ", gbif_outfile)
-    
-    # Mark checkpoint complete
-    ckpt$complete <- TRUE
-    ckpt$download_status <- "SUCCEEDED"
-    ckpt$last_updated <- as.character(Sys.time())
-    saveRDS(ckpt, ckpt_file)
-    
-    attr(gbif_clean, "gbif_status") <- list(state = "complete", method = "download", key = key, expected = total_expected)
-    
-    # Licence flagging (only if we have records)
-    if (nrow(gbif_clean) > 0) {
-      unexpected_tbl <- gbif_clean %>%
-        mutate(
-          licence = as.character(licence),
-          licence_raw = as.character(licence_raw),
-          licence_expected = !is.na(licence) & licence %in% expected_licences_gbif
-        ) %>%
-        filter(!licence_expected) %>%
-        count(licence_raw, licence, sort = TRUE) %>%
-        mutate(
-          species = species_name,
-          source = "GBIF",
-          prop_of_records = n / nrow(gbif_clean)
-        )
-      
-      if (nrow(unexpected_tbl) > 0) {
-        message("\n[LICENCE FLAG] GBIF returned licence types outside the expected set for ", species_name, ".")
-        message("Expected (normalised): ", paste(expected_licences_gbif, collapse = ", "))
-        message("Top unexpected licence entries (see log for full list):")
-        print(head(unexpected_tbl, 10), n = 10)
-        
-        write_unexpected_licence_log(
-          species_name = species_name,
-          slug = slug,
-          source_name = "GBIF",
-          unexpected_tbl = unexpected_tbl,
-          repo_root = repo_root
-        )
-      } else {
-        message("[LICENCE OK] GBIF: no unexpected licence types detected for ", species_name, ".")
-      }
-    } else {
-      message("[GBIF] No records returned after coordinate screening; skipping licence checks.")
-    }
-    
-    message("GBIF clean: ", nrow(gbif_clean), " records.")
-    gbif_clean %>% count(licence, sort = TRUE) %>% print(n = 10)
-    
-    return(gbif_clean)
   }
-  
-  # ---------------------------------------------------------------------------
-  # SEARCH path (<=100k) — with checkpoint resume, and cap-aware paging
-  # ---------------------------------------------------------------------------
-  ckpt$mode <- "search"
-  ckpt$total_expected <- total_expected
-  ckpt$last_updated <- as.character(Sys.time())
-  saveRDS(ckpt, ckpt_file)
-  
-  max_retries <- 5
-  retry_base_wait_s <- 10
-  
-  start <- 0
-  all_pages <- list()
-  
-  # Resume checkpoint if present (older schema used start/all_pages)
-  if (!is.null(ckpt$start)) start <- ckpt$start
-  if (!is.null(ckpt$all_pages)) all_pages <- ckpt$all_pages
-  
-  if (start > 0 || length(all_pages) > 0) {
-    message("Resuming GBIF search pull from start = ", start,
-            " (pages already stored: ", length(all_pages), ").")
-  }
-  
-  repeat {
-    Sys.sleep(pause_s)
-    
-    # Cap-aware paging (prevents start+limit > 100k errors)
-    limit_this <- min(page_size, gbif_search_hard_limit - start)
-    if (limit_this <= 0) {
-      message(
-        "\n[GBIF][INCOMPLETE] Hit the occ_search 100k cap for ", species_name, ".\n",
-        "This cannot be fixed by waiting/retrying; switch to downloads to retrieve the full dataset.\n"
-      )
-      ckpt$complete <- FALSE
-      ckpt$last_updated <- as.character(Sys.time())
-      saveRDS(ckpt, ckpt_file)
-      gbif_clean <- empty_gbif_clean()
-      attr(gbif_clean, "gbif_status") <- list(state = "capped", method = "search", expected = total_expected)
-      return(gbif_clean)
-    }
-    
-    res <- NULL
-    for (attempt in seq_len(max_retries)) {
-      res <- tryCatch(
-        occ_search(
-          taxonKey = taxon_key,
-          continent = region_scope,
-          hasCoordinate = TRUE,
-          limit = limit_this,
-          start = start
-        ),
-        error = function(e) e
-      )
-      
-      if (!inherits(res, "error")) break
-      
-      wait_s <- retry_base_wait_s * attempt
-      message("GBIF request failed at start = ", start,
-              " (attempt ", attempt, "/", max_retries, "): ",
-              conditionMessage(res),
-              " | waiting ", wait_s, "s then retrying...")
-      Sys.sleep(wait_s)
-    }
-    
-    if (inherits(res, "error")) {
-      ckpt$start <- start
-      ckpt$all_pages <- all_pages
-      ckpt$complete <- FALSE
-      ckpt$last_updated <- as.character(Sys.time())
-      saveRDS(ckpt, ckpt_file)
-      stop(res)
-    }
-    
-    # Total expected from meta if occ_count failed earlier
-    if (is.na(total_expected)) total_expected <- res$meta$count
-    
-    if (length(res$data) == 0) break
-    
-    all_pages[[length(all_pages) + 1]] <- res$data
-    
-    ckpt$start <- start
-    ckpt$all_pages <- all_pages
-    ckpt$total_expected <- total_expected
-    ckpt$complete <- FALSE
-    ckpt$last_updated <- as.character(Sys.time())
-    saveRDS(ckpt, ckpt_file)
-    
-    pulled_so_far <- start + nrow(res$data)
-    message("Pulled ", pulled_so_far, " / ", total_expected, " rows...")
-    
-    if (pulled_so_far >= total_expected) break
-    if (pulled_so_far >= max_records) {
-      message("Reached max_records safety limit (", max_records, ").")
-      break
-    }
-    
-    start <- start + nrow(res$data)
-  }
-  
-  gbif_raw <- bind_rows(all_pages)
-  
-  message("GBIF expected rows (query): ", total_expected)
-  message("GBIF rows pulled (paged):  ", nrow(gbif_raw))
-  
-  message("GBIF licence breakdown (RAW pull):")
-  gbif_raw %>%
-    count(license, sort = TRUE) %>%
-    mutate(prop = n / sum(n)) %>%
-    print(n = 10)
-  
-  # -------------------------------------------------------------------------
-  # Basic screening + essential fields (include QA/certainty fields)
-  # -------------------------------------------------------------------------
-  gbif_clean <- gbif_raw %>%
-    transmute(
-      source = "GBIF",
-      species = species_name,
-      gbifID = as.character(gbifID),
-      occurrenceID = as.character(occurrenceID),
-      lon = decimalLongitude,
-      lat = decimalLatitude,
-      date = as.character(eventDate),
-      year = as.integer(year),
-      country = as.character(countryCode),
-      
-      # Licence fields (no filtering)
-      licence_raw = as.character(license),
-      licence = lic_normalise_gbif(license),
-      licence_expected = !is.na(lic_normalise_gbif(license)) &
-        lic_normalise_gbif(license) %in% expected_licences_gbif,
-      
-      # QA / certainty fields
-      coordinateUncertaintyInMeters = if ("coordinateUncertaintyInMeters" %in% names(gbif_raw)) {
-        as.numeric(coordinateUncertaintyInMeters)
-      } else NA_real_,
-      
-      identificationVerificationStatus = if ("identificationVerificationStatus" %in% names(gbif_raw)) {
-        as.character(identificationVerificationStatus)
-      } else NA_character_,
-      
-      issues = if ("issues" %in% names(gbif_raw)) {
-        as.character(issues)
-      } else NA_character_,
-      
-      identifiedBy = if ("identifiedBy" %in% names(gbif_raw)) {
-        as.character(identifiedBy)
-      } else NA_character_,
-      
-      dateIdentified = if ("dateIdentified" %in% names(gbif_raw)) {
-        as.character(dateIdentified)
-      } else NA_character_
-    ) %>%
-    filter(!is.na(lon), !is.na(lat))
-  
-  message("GBIF rows (raw -> screened coords only): ", nrow(gbif_raw), " -> ", nrow(gbif_clean))
-  
-  # -------------------------------------------------------------------------
-  # De-duplication (within GBIF; light-touch)
-  # -------------------------------------------------------------------------
-  n_before <- nrow(gbif_clean)
-  gbif_clean <- gbif_clean %>%
-    distinct(gbifID, .keep_all = TRUE) %>%
-    distinct(lon, lat, date, .keep_all = TRUE)
-  message("GBIF rows (screened -> de-dup): ", n_before, " -> ", nrow(gbif_clean))
-  
-  # Save output
-  write_csv(gbif_clean, gbif_outfile)
-  message("Saved GBIF clean file: ", gbif_outfile)
-  
-  # Mark checkpoint complete only if we retrieved the full dataset (i.e., <=100k)
-  ckpt$start <- 0
-  ckpt$all_pages <- list()
-  ckpt$total_expected <- total_expected
-  ckpt$complete <- isTRUE(!is.na(total_expected) && nrow(gbif_raw) >= total_expected && total_expected <= gbif_search_hard_limit)
-  ckpt$last_updated <- as.character(Sys.time())
-  saveRDS(ckpt, ckpt_file)
   
   # ---------------------------------------------------------------------------
   # Licence flagging
@@ -789,12 +369,6 @@ pull_gbif_clean <- function(species_name,
   
   message("GBIF clean: ", nrow(gbif_clean), " records.")
   gbif_clean %>% count(licence, sort = TRUE) %>% print(n = 10)
-  
-  attr(gbif_clean, "gbif_status") <- list(
-    state = if (isTRUE(ckpt$complete)) "complete" else "incomplete",
-    method = "search",
-    expected = total_expected
-  )
   
   return(gbif_clean)
 }
@@ -1129,10 +703,7 @@ pull_raw_occurrences <- function(species_names,
                                  expected_licences_gbif = c("CC0_1_0", "CC_BY_4_0", "CC_BY_NC_4_0"),
                                  expected_licences_nbn  = c("OGL", "CC0", "CC-BY", "CC-BY-NC"),
                                  use_cache = TRUE,
-                                 species_subdir = TRUE,
-                                 gbif_method = c("auto", "search", "download"),
-                                 gbif_download_wait = FALSE,
-                                 gbif_search_hard_limit = 100000L) {
+                                 species_subdir = TRUE) {
   
   if (missing(nbn_email) || is.null(nbn_email) || !nzchar(nbn_email)) {
     stop("Please provide nbn_email (the email associated with your NBN Atlas account).")
@@ -1140,8 +711,6 @@ pull_raw_occurrences <- function(species_names,
   
   out <- vector("list", length(species_names))
   names(out) <- species_names
-  
-  gbif_incomplete <- list()
   
   for (i in seq_along(species_names)) {
     sp <- species_names[i]
@@ -1158,16 +727,8 @@ pull_raw_occurrences <- function(species_names,
       max_records = max_records,
       expected_licences_gbif = expected_licences_gbif,
       use_cache = use_cache,
-      species_subdir = species_subdir,
-      gbif_method = gbif_method,
-      gbif_download_wait = gbif_download_wait,
-      gbif_search_hard_limit = gbif_search_hard_limit
+      species_subdir = species_subdir
     )
-    
-    st <- attr(gbif_clean, "gbif_status")
-    if (!is.null(st) && !identical(st$state, "complete")) {
-      gbif_incomplete[[sp]] <- st
-    }
     
     nbn_clean <- pull_nbn_clean(
       species_name = sp,
@@ -1181,24 +742,6 @@ pull_raw_occurrences <- function(species_names,
     )
     
     out[[i]] <- list(gbif_clean = gbif_clean, nbn_clean = nbn_clean)
-  }
-  
-  # ---------------------------------------------------------------------------
-  # Final GBIF status warning (e.g., pending downloads)
-  # ---------------------------------------------------------------------------
-  if (length(gbif_incomplete) > 0) {
-    message("\n==================== GBIF WARNING ====================")
-    message("Some GBIF pulls are not yet complete.")
-    for (nm in names(gbif_incomplete)) {
-      s <- gbif_incomplete[[nm]]
-      line <- paste0(" - ", nm, ": ", s$state)
-      if (!is.null(s$key) && !is.na(s$key) && nzchar(s$key)) line <- paste0(line, " (key=", s$key, ")")
-      if (!is.null(s$status) && !is.na(s$status) && nzchar(s$status)) line <- paste0(line, " status=", s$status)
-      if (!is.null(s$expected) && !is.na(s$expected)) line <- paste0(line, " expected=", s$expected)
-      message(line)
-    }
-    message("\nRe-run the script later to resume any pending GBIF downloads.")
-    message("======================================================\n")
   }
   
   invisible(out)
