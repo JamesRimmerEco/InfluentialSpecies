@@ -44,4 +44,12 @@ data/raw/licence_flags/**
 # As such, a script is created containing my credentials, but these are not syned to GitHub. 
 data/credentials.R
 
+# Derived data products
+data/processed/**
+
+# Keep directory placeholders
+!data/processed/**/
+!data/processed/**/.gitkeep
+
+
 
