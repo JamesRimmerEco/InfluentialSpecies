@@ -11,9 +11,10 @@
 #         GBIF: duplicate gbifID, and exact repeats of (lon, lat, date)
 #         NBN : duplicate recordID, and exact repeats of (lon, lat, date)
 #
-#   Save outputs for each species to species subfolders in raw:
-#     data/raw/gbif/<group_dir>/<slug>/gbif_<slug>_clean.csv
-#     data/raw/nbn/<group_dir>/<slug>/nbn_<slug>_clean.csv
+#    Save outputs for each species:
+#    If species_subdir = TRUE: data/raw/gbif/<group_dir>/<slug>/gbif_<slug>_clean.csv
+#
+#    If species_subdir = FALSE: data/raw/gbif/<group_dir>/gbif_<slug>_clean.csv (or directly data/raw #    /gbif/... if group_dir is blank)
 #
 #   Save checkpoints to:
 #     data/_checkpoints/gbif/gbif_pull_checkpoint_<slug>.rds
@@ -140,6 +141,11 @@ slugify_species <- function(species_name) {
 # "Slugify" - just means creating a user-friendly descriptive domain, easier to read
 # than codes.
 
+# ---- Helper: Make group_dir robust when blank --------------------------------
+normalise_group_dir <- function(x) {
+  if (is.null(x) || length(x) == 0 || is.na(x) || !nzchar(x)) "" else x
+}
+
 # ---- Helper: write unexpected licence log (only if needed) -------------------
 write_unexpected_licence_log <- function(species_name, slug, source_name, unexpected_tbl, repo_root) {
   if (nrow(unexpected_tbl) == 0) return(invisible(NULL))
@@ -165,13 +171,13 @@ write_unexpected_licence_log <- function(species_name, slug, source_name, unexpe
 
 pull_gbif_clean <- function(species_name,
                             region_scope = "EUROPE",
-                            group_dir = "wasps",
+                            group_dir = "",
+                            species_subdir = FALSE,
                             pause_s = 0.25,
                             page_size = 1000,
                             max_records = Inf,
                             expected_licences_gbif = c("CC0_1_0", "CC_BY_4_0", "CC_BY_NC_4_0"),
                             use_cache = TRUE,
-                            species_subdir = TRUE,
                             gbif_method = c("auto", "search", "download"),
                             gbif_download_wait = FALSE,
                             gbif_search_hard_limit = 100000L,
@@ -180,10 +186,16 @@ pull_gbif_clean <- function(species_name,
                             gbif_email = Sys.getenv("GBIF_EMAIL")) {
   
   repo_root <- get_repo_root()
+  group_dir <- normalise_group_dir(group_dir)
+    gbif_out_root <- if (nzchar(group_dir)) {
+    file.path(repo_root, "data", "raw", "gbif", group_dir)
+  } else {
+    file.path(repo_root, "data", "raw", "gbif")
+  }
+  
   slug <- slugify_species(species_name)
   
   # Output dirs
-  gbif_out_root <- file.path(repo_root, "data", "raw", "gbif", group_dir)
   ckpt_root     <- file.path(repo_root, "data", "_checkpoints")
   gbif_ckpt_dir <- file.path(ckpt_root, "gbif")
   
@@ -200,15 +212,26 @@ pull_gbif_clean <- function(species_name,
   # Checkpoint file (also stores download keys + completion state)
   ckpt_file <- file.path(gbif_ckpt_dir, paste0("gbif_pull_checkpoint_", slug, ".rds"))
   
-  # Licence normaliser (GBIF uses URLs with 'licenses' in the path)
+  # Licence normaliser (GBIF uses URLs with 'licenses' in the path, but can accept codes as well)
   lic_normalise_gbif <- function(x) {
+    x_chr <- as.character(x)
+    x_up  <- toupper(x_chr)
+    
     dplyr::case_when(
-      stringr::str_detect(x, "publicdomain/zero/1.0") ~ "CC0_1_0",
-      stringr::str_detect(x, "licenses/by/4.0") ~ "CC_BY_4_0",
-      stringr::str_detect(x, "licenses/by-nc/4.0") ~ "CC_BY_NC_4_0",
+      is.na(x_chr) ~ NA_character_,
+      
+      # already-normalised codes (seen in download files)
+      x_up %in% c("CC0_1_0", "CC_BY_4_0", "CC_BY_NC_4_0") ~ x_up,
+      
+      # URL forms (seen in occ_search)
+      stringr::str_detect(x_chr, "publicdomain/zero/1.0") ~ "CC0_1_0",
+      stringr::str_detect(x_chr, "licenses/by-nc/4.0") ~ "CC_BY_NC_4_0",
+      stringr::str_detect(x_chr, "licenses/by/4.0") ~ "CC_BY_4_0",
+      
       TRUE ~ NA_character_
     )
   }
+  
   
   # Columns that MUST exist in cached outputs to be considered "current schema"
   required_cache_cols <- c(
@@ -368,6 +391,7 @@ pull_gbif_clean <- function(species_name,
     
     # If no key yet, submit a download and return (so the run can continue to other species)
     if (is.null(ckpt$download_key) || is.na(ckpt$download_key) || !nzchar(ckpt$download_key)) {
+      
       dl <- rgbif::occ_download(
         rgbif::pred_and(
           rgbif::pred("taxonKey", taxon_key),
@@ -376,7 +400,11 @@ pull_gbif_clean <- function(species_name,
         ),
         user = gbif_user, pwd = gbif_pwd, email = gbif_email
       )
-      ckpt$download_key <- dl$key
+      
+      # occ_download() may return either a list with $key OR an atomic key (character)
+      dl_key <- if (is.list(dl) && "key" %in% names(dl)) dl$key else as.character(dl)
+      
+      ckpt$download_key <- dl_key
       ckpt$download_status <- "SUBMITTED"
       ckpt$complete <- FALSE
       ckpt$last_updated <- as.character(Sys.time())
@@ -452,19 +480,39 @@ pull_gbif_clean <- function(species_name,
       "identifiedBy", "dateIdentified"
     )
     
+    ct <- readr::cols(
+      gbifID = readr::col_character(),
+      occurrenceID = readr::col_character(),
+      decimalLongitude = readr::col_double(),
+      decimalLatitude  = readr::col_double(),
+      eventDate = readr::col_character(),
+      year = readr::col_integer(),
+      countryCode = readr::col_character(),
+      license = readr::col_character(),
+      coordinateUncertaintyInMeters = readr::col_double(),
+      identificationVerificationStatus = readr::col_character(),
+      issues = readr::col_character(),
+      issue  = readr::col_character(),
+      identifiedBy = readr::col_character(),
+      dateIdentified = readr::col_character(),
+      .default = readr::col_character()
+    )
+    
     if (grepl("\\.csv$", occ_file, ignore.case = TRUE)) {
       gbif_raw <- readr::read_csv(
         occ_file,
         show_col_types = FALSE,
         progress = TRUE,
-        col_select = any_of(needed_cols)
+        col_select = dplyr::any_of(needed_cols),
+        col_types = ct
       )
     } else {
       gbif_raw <- readr::read_tsv(
         occ_file,
         show_col_types = FALSE,
         progress = TRUE,
-        col_select = any_of(needed_cols)
+        col_select = dplyr::any_of(needed_cols),
+        col_types = ct
       )
     }
     
@@ -798,25 +846,32 @@ pull_gbif_clean <- function(species_name,
   
   return(gbif_clean)
 }
-
+  
 # ==============================================================================
 # NBN pull (UK Atlas) ----------------------------------------------------------
 # ==============================================================================
 
 pull_nbn_clean <- function(species_name,
-                           group_dir = "wasps",
+                           group_dir = "",
+                           species_subdir = FALSE,
                            nbn_email,
                            download_reason_id = 17,
                            expected_licences_nbn = c("OGL", "CC0", "CC-BY", "CC-BY-NC"),
                            use_cache = TRUE,
-                           pause_s = 0.25,
-                           species_subdir = TRUE) {
+                           pause_s = 0.25)
+                           {
   
   repo_root <- get_repo_root()
+  group_dir <- normalise_group_dir(group_dir)
+    nbn_out_root <- if (nzchar(group_dir)) {
+    file.path(repo_root, "data", "raw", "nbn", group_dir)
+  } else {
+    file.path(repo_root, "data", "raw", "nbn")
+  }
+  
   slug <- slugify_species(species_name)
   
   # Output dirs
-  nbn_out_root <- file.path(repo_root, "data", "raw", "nbn", group_dir)
   ckpt_root    <- file.path(repo_root, "data", "_checkpoints")
   nbn_ckpt_dir <- file.path(ckpt_root, "nbn")
   
@@ -1119,7 +1174,8 @@ pull_nbn_clean <- function(species_name,
 # ==============================================================================
 
 pull_raw_occurrences <- function(species_names,
-                                 group_dir = "wasps",
+                                 group_dir = "",
+                                 species_subdir = FALSE,
                                  region_scope = "EUROPE",
                                  pause_s = 0.25,
                                  page_size = 1000,
@@ -1129,7 +1185,6 @@ pull_raw_occurrences <- function(species_names,
                                  expected_licences_gbif = c("CC0_1_0", "CC_BY_4_0", "CC_BY_NC_4_0"),
                                  expected_licences_nbn  = c("OGL", "CC0", "CC-BY", "CC-BY-NC"),
                                  use_cache = TRUE,
-                                 species_subdir = TRUE,
                                  gbif_method = c("auto", "search", "download"),
                                  gbif_download_wait = FALSE,
                                  gbif_search_hard_limit = 100000L) {

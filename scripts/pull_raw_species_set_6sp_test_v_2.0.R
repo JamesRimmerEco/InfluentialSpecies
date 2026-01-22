@@ -3,9 +3,10 @@
 # Run the raw occurrence pull for a defined set of species.
 # Folder paths + file saving are handled inside: InfluentialSpecies/R/pull_raw_occurrences.R
 #
-# Outputs write into species subfolders automatically, e.g.:
-#   data/raw/gbif/<group_dir>/<species_slug>/gbif_<species_slug>_clean.csv
-#   data/raw/nbn/<group_dir>/<species_slug>/nbn_<species_slug>_clean.csv
+# Outputs write into GBIF/NBN subfolders automatically, e.g.:
+#   data/raw/gbif/<species_slug>/gbif_<species_slug>_clean.csv
+#   data/raw/nbn/<species_slug>/nbn_<species_slug>_clean.csv
+# 
 
 # ---- Find this script’s directory (works when sourced from a file) ----
 this_file <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
@@ -33,8 +34,8 @@ nbn_email <- "jamesrimmer92@mail.com"  # email used for NBN (galah) access
 # the pull script will auto-repull if cached CSVs are missing the new QA columns.
 use_cache <- TRUE
 
-# Recommended: keep each species set in its own group folder.
-group_dir <- "set_6sp_test"
+# write straight into data/raw/gbif and data/raw/nbn
+group_dir <- ""  
 
 # Species list (Latin names only; common names in comments for readability but not needed)
 species_names <- c(
@@ -52,7 +53,7 @@ pull_raw_occurrences(
   group_dir          = group_dir,
   nbn_email          = nbn_email,
   use_cache          = use_cache,
-  species_subdir     = TRUE,
+  species_subdir     = FALSE,
   gbif_method        = "auto",
   gbif_download_wait = FALSE
 )
