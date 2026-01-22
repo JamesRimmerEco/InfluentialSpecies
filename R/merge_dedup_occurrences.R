@@ -12,7 +12,21 @@
 #       * exactly 1 GBIF + 1 NBN record
 #       * same rounded coords (coord_round_dp)
 #       * both have true day-level date (YYYY-MM-DD, not an interval)
-#   - Everything else is kept (no aggressive de-duplication in this section of the pipeline)
+#       * drop only the non-preferred source in that 1-to-1 pair
+#   - Everything else is kept (no aggressive de-duplication in this section)
+#
+#   - Input discovery is now automatic:
+#       * supports grouped + ungrouped raw layouts
+#       * supports species-subdir + flat raw layouts
+#     so you can run test pulls with group_dir="" and/or species_subdir=FALSE
+#     without breaking the merge stage.
+#
+#   - Cached merged outputs are refreshed automatically if raw inputs are newer:
+#       refresh_if_inputs_newer = TRUE (default)
+#     This is important when GBIF downloads are pending:
+#       * you might merge "NBN-only" today,
+#       * then GBIF finishes later and writes gbif_<slug>_clean.csv,
+#       * re-running merge will automatically rebuild (even with overwrite=FALSE).
 
 suppressPackageStartupMessages({
   library(dplyr)
@@ -40,9 +54,14 @@ slugify_species <- function(species_name) {
   slug
 }
 
+# ---- Helper: normalise group_dir (matches pull stage) ------------------------
+normalise_group_dir <- function(x) {
+  if (is.null(x) || length(x) == 0 || is.na(x) || !nzchar(x)) "" else x
+}
+
 # ---- Helper: safe read -------------------------------------------------------
 read_csv_if_exists <- function(path) {
-  if (!file.exists(path)) return(NULL)
+  if (is.null(path) || is.na(path) || !nzchar(path) || !file.exists(path)) return(NULL)
   readr::read_csv(path, show_col_types = FALSE, progress = FALSE)
 }
 
@@ -50,7 +69,6 @@ read_csv_if_exists <- function(path) {
 parse_day_date <- function(x) {
   if (is.na(x) || !nzchar(x)) return(as.Date(NA))
   if (str_detect(x, "/")) return(as.Date(NA)) # interval/range
-  
   if (!str_detect(x, "\\d{4}-\\d{2}-\\d{2}")) return(as.Date(NA))
   
   d1 <- suppressWarnings(lubridate::ymd_hms(x, quiet = TRUE, tz = "UTC"))
@@ -61,6 +79,48 @@ parse_day_date <- function(x) {
   if (!is.na(d3)) return(as.Date(d3))
   
   as.Date(NA)
+}
+
+# ---- Helper: find raw clean CSV (supports old/new layouts) -------------------
+# Tries multiple plausible locations and returns the first match, else NA.
+find_raw_clean_csv <- function(repo_root, raw_dir, source, group_dir, slug) {
+  src <- tolower(source)
+  fname <- paste0(src, "_", slug, "_clean.csv")
+  group_dir <- normalise_group_dir(group_dir)
+  
+  candidates <- c(
+    # grouped + species subdir
+    file.path(repo_root, raw_dir, src, group_dir, slug, fname),
+    # grouped + flat
+    file.path(repo_root, raw_dir, src, group_dir, fname),
+    # ungrouped + species subdir
+    file.path(repo_root, raw_dir, src, slug, fname),
+    # ungrouped + flat
+    file.path(repo_root, raw_dir, src, fname)
+  )
+  
+  hit <- candidates[file.exists(candidates)]
+  if (length(hit) == 0) return(NA_character_)
+  hit[1]
+}
+
+# ---- Helper: short note if GBIF is pending (optional but useful) -------------
+gbif_pending_note <- function(repo_root, slug) {
+  ckpt <- file.path(
+    repo_root, "data", "_checkpoints", "gbif",
+    paste0("gbif_pull_checkpoint_", slug, ".rds")
+  )
+  if (!file.exists(ckpt)) return("")
+  x <- tryCatch(readRDS(ckpt), error = function(e) NULL)
+  if (is.null(x)) return("")
+  if (isTRUE(x$complete)) return("")
+  
+  if (!is.null(x$download_key) && !is.na(x$download_key) && nzchar(x$download_key)) {
+    st <- if (!is.null(x$download_status) && !is.na(x$download_status)) x$download_status else "UNKNOWN"
+    return(paste0("GBIF pending download (key=", x$download_key, ", status=", st, ")"))
+  }
+  
+  ""
 }
 
 # ---- Helper: write merged output (single file, parquet preferred) ------------
@@ -76,21 +136,31 @@ write_merged_single <- function(df, out_base_no_ext) {
   }
 }
 
+# Small helper for NULL-coalescing without importing extra deps
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
 # ---- Main function -----------------------------------------------------------
 merge_occurrences <- function(species_names,
-                              group_dir,
+                              group_dir = "",
                               raw_dir = file.path("data", "raw"),
                               out_root = file.path("data", "processed", "01_merged"),
-                              species_subdir = TRUE,
+                              species_subdir = TRUE, # kept for backward compatibility; not used for input discovery now
                               coord_round_dp = 4,
                               prefer_source = c("GBIF", "NBN"),
                               overwrite = FALSE,
+                              refresh_if_inputs_newer = TRUE,
                               continue_on_error = TRUE) {
   
   prefer_source <- match.arg(toupper(prefer_source), c("GBIF", "NBN"))
   repo_root <- get_repo_root()
+  group_dir <- normalise_group_dir(group_dir)
   
-  out_group_dir <- file.path(repo_root, out_root, group_dir)
+  # Output group directory (handle group_dir="" cleanly)
+  out_group_dir <- if (nzchar(group_dir)) {
+    file.path(repo_root, out_root, group_dir)
+  } else {
+    file.path(repo_root, out_root)
+  }
   dir.create(out_group_dir, recursive = TRUE, showWarnings = FALSE)
   
   run_log <- tibble(
@@ -159,7 +229,7 @@ merge_occurrences <- function(species_names,
     df$date_is_range <- ifelse(is.na(df$date_raw), FALSE, str_detect(df$date_raw, "/"))
     df$event_day <- as.Date(vapply(df$date_raw, parse_day_date, as.Date(NA)))
     
-    # Year: keep existing "year" column if present; otherwise try to infer from event_day
+    # Year: keep existing "year" column if present; otherwise infer from event_day
     if (!"year" %in% names(df) || all(is.na(df$year))) {
       df$year <- ifelse(!is.na(df$event_day), year(df$event_day), NA_integer_)
     }
@@ -184,38 +254,73 @@ merge_occurrences <- function(species_names,
     df
   }
   
+  # Date precision breakdowns (pre-drop), without tidyr dependency
+  prec_counts <- function(df) {
+    if (is.null(df)) return(c(day = 0L, year = 0L, unknown = 0L))
+    tab <- table(df$date_precision, useNA = "no")
+    c(
+      day = as.integer(if ("day" %in% names(tab)) tab[["day"]] else 0L),
+      year = as.integer(if ("year" %in% names(tab)) tab[["year"]] else 0L),
+      unknown = as.integer(if ("unknown" %in% names(tab)) tab[["unknown"]] else 0L)
+    )
+  }
+  
   for (sp in species_names) {
     slug <- slugify_species(sp)
     
-    gbif_dir <- file.path(repo_root, raw_dir, "gbif", group_dir, if (isTRUE(species_subdir)) slug else "")
-    nbn_dir  <- file.path(repo_root, raw_dir, "nbn",  group_dir, if (isTRUE(species_subdir)) slug else "")
+    # Discover raw inputs robustly (supports old/new layouts)
+    gbif_file <- find_raw_clean_csv(repo_root, raw_dir, "gbif", group_dir, slug)
+    nbn_file  <- find_raw_clean_csv(repo_root, raw_dir, "nbn",  group_dir, slug)
     
-    gbif_file <- file.path(gbif_dir, paste0("gbif_", slug, "_clean.csv"))
-    nbn_file  <- file.path(nbn_dir,  paste0("nbn_",  slug, "_clean.csv"))
+    gbif_exists <- !is.na(gbif_file) && file.exists(gbif_file)
+    nbn_exists  <- !is.na(nbn_file)  && file.exists(nbn_file)
     
-    gbif_exists <- file.exists(gbif_file)
-    nbn_exists  <- file.exists(nbn_file)
+    pending_note <- if (!gbif_exists) gbif_pending_note(repo_root, slug) else ""
     
+    # Output paths
     out_sp_dir <- file.path(out_group_dir, slug)
     dir.create(out_sp_dir, recursive = TRUE, showWarnings = FALSE)
     out_base <- file.path(out_sp_dir, paste0("occ_", slug, "__merged"))
     
-    # Skip if output exists and overwrite=FALSE
-    if (!overwrite && (file.exists(paste0(out_base, ".parquet")) || file.exists(paste0(out_base, ".rds")))) {
-      run_log <- add_row(
-        run_log,
-        species = sp, slug = slug,
-        gbif_exists = gbif_exists, nbn_exists = nbn_exists,
-        n_gbif = NA_integer_, n_nbn = NA_integer_,
-        n_premerge = NA_integer_, n_strict_keys = NA_integer_,
-        n_dropped_strict = NA_integer_, n_final = NA_integer_,
-        n_day_gbif = NA_integer_, n_year_gbif = NA_integer_, n_unknown_gbif = NA_integer_,
-        n_day_nbn = NA_integer_, n_year_nbn = NA_integer_, n_unknown_nbn = NA_integer_,
-        out_file = if (file.exists(paste0(out_base, ".parquet"))) paste0(out_base, ".parquet") else paste0(out_base, ".rds"),
-        status = "skipped_cached",
-        note = "Merged output already exists (overwrite=FALSE)."
-      )
-      next
+    out_parq <- paste0(out_base, ".parquet")
+    out_rds  <- paste0(out_base, ".rds")
+    out_existing <- if (file.exists(out_parq)) out_parq else if (file.exists(out_rds)) out_rds else NA_character_
+    
+    # Skip if output exists and overwrite=FALSE, unless inputs are newer (refresh)
+    if (!overwrite && !is.na(out_existing)) {
+      refresh <- FALSE
+      
+      if (isTRUE(refresh_if_inputs_newer)) {
+        inputs <- c(gbif_file, nbn_file)
+        inputs <- inputs[!is.na(inputs) & file.exists(inputs)]
+        if (length(inputs) > 0) {
+          newest_in <- max(file.info(inputs)$mtime, na.rm = TRUE)
+          out_time  <- file.info(out_existing)$mtime
+          if (!is.na(newest_in) && newest_in > out_time) refresh <- TRUE
+        }
+      }
+      
+      if (!refresh) {
+        note_msg <- "Merged output exists and inputs not newer (overwrite=FALSE)."
+        if (nzchar(pending_note)) note_msg <- paste(note_msg, pending_note, sep = " | ")
+        
+        run_log <- add_row(
+          run_log,
+          species = sp, slug = slug,
+          gbif_exists = gbif_exists, nbn_exists = nbn_exists,
+          n_gbif = NA_integer_, n_nbn = NA_integer_,
+          n_premerge = NA_integer_, n_strict_keys = NA_integer_,
+          n_dropped_strict = NA_integer_, n_final = NA_integer_,
+          n_day_gbif = NA_integer_, n_year_gbif = NA_integer_, n_unknown_gbif = NA_integer_,
+          n_day_nbn = NA_integer_, n_year_nbn = NA_integer_, n_unknown_nbn = NA_integer_,
+          out_file = out_existing,
+          status = "skipped_cached",
+          note = note_msg
+        )
+        next
+      } else {
+        message("[01_merged] Refreshing cached output (inputs newer): ", sp)
+      }
     }
     
     do_one <- function() {
@@ -223,7 +328,11 @@ merge_occurrences <- function(species_names,
       nbn  <- read_csv_if_exists(nbn_file)
       
       if (is.null(gbif) && is.null(nbn)) {
-        return(list(status = "no_inputs", note = "Neither GBIF nor NBN input found.", out_file = NA_character_))
+        return(list(
+          status = "no_inputs",
+          note = "Neither GBIF nor NBN input found.",
+          out_file = NA_character_
+        ))
       }
       
       gbif2 <- add_basics(gbif, "GBIF", slug, sp, coord_round_dp)
@@ -232,23 +341,8 @@ merge_occurrences <- function(species_names,
       n_gbif <- if (is.null(gbif2)) 0L else nrow(gbif2)
       n_nbn  <- if (is.null(nbn2))  0L else nrow(nbn2)
       
-      # Date precision breakdowns (pre-drop)
-      prec_counts <- function(df, src) {
-        if (is.null(df)) return(c(day = 0L, year = 0L, unknown = 0L))
-        out <- df %>% count(date_precision) %>% tidyr::pivot_wider(names_from = date_precision, values_from = n, values_fill = 0)
-        day <- if ("day" %in% names(out)) as.integer(out$day) else 0L
-        year <- if ("year" %in% names(out)) as.integer(out$year) else 0L
-        unknown <- if ("unknown" %in% names(out)) as.integer(out$unknown) else 0L
-        c(day = day, year = year, unknown = unknown)
-      }
-      
-      # We use tidyr only for this small convenience; if you want to avoid tidyr, we can rewrite.
-      if (!requireNamespace("tidyr", quietly = TRUE)) {
-        stop("Package 'tidyr' is required for logging date_precision counts. Install via install.packages('tidyr').")
-      }
-      
-      gbif_prec <- prec_counts(gbif2, "GBIF")
-      nbn_prec  <- prec_counts(nbn2,  "NBN")
+      gbif_prec <- prec_counts(gbif2)
+      nbn_prec  <- prec_counts(nbn2)
       
       merged_pre <- bind_rows(gbif2, nbn2)
       
@@ -279,7 +373,13 @@ merge_occurrences <- function(species_names,
       
       out_file <- write_merged_single(merged_post, out_base)
       
-      status <- if (n_gbif > 0 && n_nbn > 0) "ok_both_sources" else if (n_gbif > 0) "ok_gbif_only" else "ok_nbn_only"
+      status <- if (n_gbif > 0 && n_nbn > 0) {
+        "ok_both_sources"
+      } else if (n_gbif > 0) {
+        "ok_gbif_only"
+      } else {
+        "ok_nbn_only"
+      }
       
       list(
         status = status,
@@ -304,6 +404,10 @@ merge_occurrences <- function(species_names,
       }
     )
     
+    # Combine notes (e.g. GBIF pending download) with any function note
+    note_combined <- paste(c(res$note, pending_note), collapse = " | ")
+    note_combined <- str_replace(note_combined, "^(\\s*\\|\\s*)+|(\\s*\\|\\s*)+$", "")
+    
     run_log <- add_row(
       run_log,
       species = sp,
@@ -324,7 +428,7 @@ merge_occurrences <- function(species_names,
       n_unknown_nbn = if (!is.null(res$nbn_prec)) res$nbn_prec["unknown"] else NA_integer_,
       out_file = res$out_file,
       status = res$status,
-      note = res$note
+      note = note_combined
     )
     
     message("[01_merged] ", sp, " -> ", res$status,
@@ -337,6 +441,3 @@ merge_occurrences <- function(species_names,
   
   invisible(run_log)
 }
-
-# Small helper for NULL-coalescing without importing extra deps
-`%||%` <- function(a, b) if (!is.null(a)) a else b
