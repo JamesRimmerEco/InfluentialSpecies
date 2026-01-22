@@ -1,13 +1,29 @@
 # scripts/merge_dedup_species_set_6sp_test.R ----------------------------------
-# Stage 01: merge and safe 1-to-1 day duplicate auto-drop for 6 species test set
+# Stage 01: merge and safe 1-to-1 day duplicate auto-drop for a test species set
+#
+# Purpose:
+#   Run the Stage 01 merge step for a small species list, producing per-species merged
+#   outputs and a run log.
+#
+# Outputs:
+#   data/processed/01_merged/<slug>/occ_<slug>__merged.(parquet|rds)
+#   data/processed/01_merged/_runlog_01_merged.csv
+#
+# Behaviour:
+#   - Reads raw-clean CSVs from data/raw/gbif and data/raw/nbn (created by pull_raw_occurrences()).
+#   - Merges GBIF + NBN for each species and retains all original columns.
+#   - Adds derived fields used downstream (IDs, parsed day, rounded coordinates, keys).
+#   - Drops only the most conservative cross-source duplicates:
+#       * exactly 1 GBIF + 1 NBN record share the same rounded coordinates and true day-level date
+#       * the non-preferred source record is dropped (prefer_source)
+#   - If only one source is available for a species, the merge still runs and writes output.
 #
 # Notes:
-# - Uses InfluentialSpecies/R/merge_dedup_occurrences.R
-# - Input discovery is robust (grouped/ungrouped, subdir/flat) in the merge function.
-# - If GBIF downloads are pending for a species, you can still run this:
-#     * it will merge whatever is available now (often NBN-only),
-#     * then on later runs it will automatically refresh when new raw CSVs appear,
-#       as long as refresh_if_inputs_newer = TRUE (default here).
+#   - Raw inputs may be grouped (data/raw/<src>/<group>/...) or ungrouped (data/raw/<src>/...).
+#     This script can be used with either layout by setting group_dir appropriately.
+#   - When GBIF downloads are still pending, some species may only have NBN inputs available.
+#     Re-running later will incorporate new GBIF files if refresh_if_inputs_newer=TRUE.
+
 
 # ---- Find this script’s directory (works when sourced from a file) ----
 this_file <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
@@ -34,9 +50,8 @@ source(merge_fn)
 
 # ---- Key settings ----
 # If you used a grouped pull, set e.g. "set_6sp_test".
-# If you wrote straight into data/raw/gbif and data/raw/nbn, set "".
-group_dir <- "set_6sp_test"
-# group_dir <- ""   # <-- quick switch for ad-hoc / ungrouped test pulls
+# If you wrote straight into data/raw/gbif and data/raw/nbn, set group_dir <- "".
+group_dir <- ""   # <-- your current setup
 
 species_names <- c(
   "Myrmica sabuleti",
@@ -51,22 +66,20 @@ species_names <- c(
 coord_round_dp <- 4
 prefer_source  <- "GBIF"
 
-# Optional: while GBIF downloads are pending, you may want to merge only
-# species that currently have at least one raw input present (GBIF or NBN).
-# Set TRUE to skip species with no current inputs at all.
+# Optional: while GBIF downloads are pending, you can choose to only merge species
+# that have at least one raw input present. (merge_occurrences() also handles missing
+# inputs gracefully, so this is just a convenience.)
 only_merge_if_any_input_exists <- TRUE
 
-# ---- Helper: quick existence check for raw inputs (supports old/new layouts) ----
-# (merge_occurrences() will also handle missing inputs gracefully; this just helps
-# you avoid cluttering logs with "no_inputs" while a species is pending.)
-normalise_group_dir <- function(x) {
-  if (is.null(x) || length(x) == 0 || is.na(x) || !nzchar(x)) "" else x
-}
-
+# ---- Helper: slugify + raw input discovery (matches merge script) ----
 slugify_species <- function(species_name) {
   slug <- gsub("[^a-z0-9]+", "_", tolower(species_name))
   slug <- gsub("^_+|_+$", "", slug)
   slug
+}
+
+normalise_group_dir <- function(x) {
+  if (is.null(x) || length(x) == 0 || is.na(x) || !nzchar(x)) "" else x
 }
 
 find_raw_clean_csv <- function(repo_root, raw_dir, source, group_dir, slug) {
@@ -92,20 +105,13 @@ if (isTRUE(only_merge_if_any_input_exists)) {
     slug <- slugify_species(sp)
     gbif <- find_raw_clean_csv(repo_root, raw_dir, "gbif", group_dir, slug)
     nbn  <- find_raw_clean_csv(repo_root, raw_dir, "nbn",  group_dir, slug)
-    any(file.exists(c(gbif, nbn)))
+    (!is.na(gbif) && file.exists(gbif)) || (!is.na(nbn) && file.exists(nbn))
   }, logical(1))
   
-  if (!any(keep)) {
-    message("No raw inputs found yet for any species in this set. Nothing to merge.")
-    quit(save = "no", status = 0)
+  dropped <- species_names[!keep]
+  if (length(dropped) > 0) {
+    message("Skipping species with no raw inputs present: ", paste(dropped, collapse = ", "))
   }
-  
-  skipped <- species_names[!keep]
-  if (length(skipped) > 0) {
-    message("Skipping species with no current inputs (yet):")
-    for (s in skipped) message(" - ", s)
-  }
-  
   species_names <- species_names[keep]
 }
 
@@ -116,6 +122,6 @@ merge_occurrences(
   coord_round_dp          = coord_round_dp,
   prefer_source           = prefer_source,
   overwrite               = FALSE,
-  refresh_if_inputs_newer = TRUE,
+  refresh_if_inputs_newer = TRUE,   # key: re-run later to pick up newly arrived GBIF downloads
   continue_on_error       = TRUE
 )
