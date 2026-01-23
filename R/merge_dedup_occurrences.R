@@ -17,11 +17,17 @@
 #
 # Notes:
 #   - Raw inputs may be laid out in different ways (grouped/ungrouped, flat/subdir).
-#     This script searches a small set of sensible candidate paths and uses the first hit.
+#     This script searches a small set of candidate paths and uses the first hit.
 #   - Raw CSVs are read with all columns forced to character to avoid readr/vroom
 #     type-guess issues around dates.
 #   - This stage can run even if only one source is available for a species
 #     (e.g., GBIF download still pending but NBN already present).
+#
+# Performance:
+#   - Day-level dates are extracted using a vectorised approach (rather than parsing
+#     each row with multiple date-time parsers).
+#   - Duplicate detection is done on a slim key table and then applied back to the
+#     full merged data via occ_uid, avoiding an expensive join on the full dataset.
 
 suppressPackageStartupMessages({
   library(dplyr)
@@ -56,10 +62,10 @@ normalise_group_dir <- function(x) {
 
 # ---- Helper: find raw clean CSV (supports old/new layouts) -------------------
 # Candidate layouts:
-#   grouped + species subdir : data/raw/<src>/<group>/<slug>/<src>_<slug>_clean.csv
-#   grouped + flat          : data/raw/<src>/<group>/<src>_<slug>_clean.csv
-#   ungrouped + species subdir: data/raw/<src>/<slug>/<src>_<slug>_clean.csv
-#   ungrouped + flat        : data/raw/<src>/<src>_<slug>_clean.csv
+#   grouped + species subdir   : data/raw/<src>/<group>/<slug>/<src>_<slug>_clean.csv
+#   grouped + flat             : data/raw/<src>/<group>/<src>_<slug>_clean.csv
+#   ungrouped + species subdir : data/raw/<src>/<slug>/<src>_<slug>_clean.csv
+#   ungrouped + flat           : data/raw/<src>/<src>_<slug>_clean.csv
 find_raw_clean_csv <- function(repo_root, raw_dir, source, group_dir, slug) {
   src <- tolower(source)
   fname <- paste0(src, "_", slug, "_clean.csv")
@@ -102,19 +108,33 @@ read_csv_if_exists <- function(path) {
 }
 
 # ---- Helper: parse "true day" dates only ------------------------------------
-parse_day_date <- function(x) {
-  if (is.na(x) || !nzchar(x)) return(as.Date(NA))
-  if (str_detect(x, "/")) return(as.Date(NA)) # interval/range
-  if (!str_detect(x, "\\d{4}-\\d{2}-\\d{2}")) return(as.Date(NA))
+# Some raw eventDate strings include times (e.g. YYYY-MM-DDTHH:MM:SS).
+# For this stage, the conservative duplicate rule needs only the day.
+# Intervals/ranges (containing "/") are treated as not day-precise.
+parse_day_date_vec <- function(x) {
+  x_chr <- as.character(x)
   
-  d1 <- suppressWarnings(lubridate::ymd_hms(x, quiet = TRUE, tz = "UTC"))
-  if (!is.na(d1)) return(as.Date(d1))
-  d2 <- suppressWarnings(lubridate::ymd_hm(x, quiet = TRUE, tz = "UTC"))
-  if (!is.na(d2)) return(as.Date(d2))
-  d3 <- suppressWarnings(lubridate::ymd(x, quiet = TRUE))
-  if (!is.na(d3)) return(as.Date(d3))
+  out <- rep(NA_character_, length(x_chr))
+  if (length(x_chr) == 0) return(as.Date(out))
   
-  as.Date(NA)
+  # Drop blanks and intervals/ranges
+  is_blank <- is.na(x_chr) | !nzchar(x_chr)
+  is_range <- !is_blank & stringr::str_detect(x_chr, "/")
+  
+  # Find the first YYYY-MM-DD substring anywhere in the string
+  m <- rep(-1L, length(x_chr))
+  ok_search <- !is_blank & !is_range
+  if (any(ok_search)) {
+    m[ok_search] <- regexpr("\\d{4}-\\d{2}-\\d{2}", x_chr[ok_search])
+  }
+  ok <- ok_search & (m > 0)
+  
+  if (any(ok)) {
+    start <- m[ok]
+    out[ok] <- substr(x_chr[ok], start, start + 9)
+  }
+  
+  as.Date(out)
 }
 
 # ---- Helper: GBIF pending note (download key/status) -------------------------
@@ -171,7 +191,7 @@ merge_occurrences <- function(species_names,
   repo_root <- get_repo_root()
   group_dir <- normalise_group_dir(group_dir)
   
-  # Output path convention: no extra grouping under processed.
+  # Output path convention: write all merged outputs under out_root, regardless of group_dir.
   out_group_dir <- file.path(repo_root, out_root)
   dir.create(out_group_dir, recursive = TRUE, showWarnings = FALSE)
   
@@ -205,6 +225,7 @@ merge_occurrences <- function(species_names,
     try(readr::write_csv(run_log, runlog_path), silent = TRUE)
   }, add = TRUE)
   
+  # Adds derived fields without dropping any existing columns.
   add_basics <- function(df, source_name, slug, species_input, coord_round_dp) {
     if (is.null(df)) return(NULL)
     
@@ -246,7 +267,7 @@ merge_occurrences <- function(species_names,
     # Date parsing / precision.
     df$date_raw <- as.character(df$date)
     df$date_is_range <- ifelse(is.na(df$date_raw), FALSE, str_detect(df$date_raw, "/"))
-    df$event_day <- as.Date(vapply(df$date_raw, parse_day_date, as.Date(NA)))
+    df$event_day <- parse_day_date_vec(df$date_raw)
     
     # Year: prefer a provided year if present; otherwise infer from event_day.
     if (!"year" %in% names(df) || all(is.na(df$year))) {
@@ -405,26 +426,31 @@ merge_occurrences <- function(species_names,
       
       merged_pre <- bind_rows(gbif2, nbn2)
       
-      eligible_keys <- merged_pre %>%
+      # Duplicate detection is done on a slim table and applied back to the full data.
+      keys_df <- merged_pre %>%
+        select(occ_uid, source, key_day) %>%
         filter(!is.na(key_day)) %>%
+        mutate(source_u = toupper(source))
+      
+      eligible_keys <- keys_df %>%
         group_by(key_day) %>%
         summarise(
           n = n(),
-          n_gbif = sum(toupper(source) == "GBIF"),
-          n_nbn  = sum(toupper(source) == "NBN"),
+          n_gbif = sum(source_u == "GBIF"),
+          n_nbn  = sum(source_u == "NBN"),
           .groups = "drop"
         ) %>%
         filter(n == 2, n_gbif == 1, n_nbn == 1)
       
       n_strict_keys <- nrow(eligible_keys)
       
+      drop_uids <- keys_df %>%
+        semi_join(eligible_keys, by = "key_day") %>%
+        filter(source_u != prefer_source) %>%
+        distinct(occ_uid)
+      
       merged_post <- merged_pre %>%
-        left_join(eligible_keys %>% mutate(is_strict_1to1_day = TRUE), by = "key_day") %>%
-        mutate(
-          is_strict_1to1_day = ifelse(is.na(is_strict_1to1_day), FALSE, is_strict_1to1_day),
-          drop_candidate = is_strict_1to1_day & toupper(source) != prefer_source
-        ) %>%
-        filter(!drop_candidate)
+        anti_join(drop_uids, by = "occ_uid")
       
       n_dropped <- nrow(merged_pre) - nrow(merged_post)
       
