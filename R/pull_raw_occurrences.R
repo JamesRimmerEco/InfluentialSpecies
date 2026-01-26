@@ -187,7 +187,7 @@ pull_gbif_clean <- function(species_name,
   
   repo_root <- get_repo_root()
   group_dir <- normalise_group_dir(group_dir)
-    gbif_out_root <- if (nzchar(group_dir)) {
+  gbif_out_root <- if (nzchar(group_dir)) {
     file.path(repo_root, "data", "raw", "gbif", group_dir)
   } else {
     file.path(repo_root, "data", "raw", "gbif")
@@ -237,7 +237,16 @@ pull_gbif_clean <- function(species_name,
   required_cache_cols <- c(
     "coordinateUncertaintyInMeters",
     "identificationVerificationStatus",
-    "issues"
+    "issues",
+    # Record type / provenance fields (used for Stage 03+ filtering/diagnostics)
+    "basisOfRecord",
+    "taxonRank",
+    "occurrenceStatus",
+    "datasetKey",
+    "datasetName",
+    "publishingOrgKey",
+    "institutionCode",
+    "collectionCode"
   )
   
   # Always return a tibble with the expected schema (even if 0 rows)
@@ -259,7 +268,16 @@ pull_gbif_clean <- function(species_name,
       identificationVerificationStatus = character(),
       issues = character(),
       identifiedBy = character(),
-      dateIdentified = character()
+      dateIdentified = character(),
+      # Record type / provenance fields
+      basisOfRecord = character(),
+      taxonRank = character(),
+      occurrenceStatus = character(),
+      datasetKey = character(),
+      datasetName = character(),
+      publishingOrgKey = character(),
+      institutionCode = character(),
+      collectionCode = character()
     )
   }
   
@@ -300,7 +318,7 @@ pull_gbif_clean <- function(species_name,
     
     if (length(missing_cols) > 0) {
       message(
-        "Found existing GBIF clean file but it is missing new QA columns: ",
+        "Found existing GBIF clean file but it is missing required columns for the current schema: ",
         paste(missing_cols, collapse = ", "),
         "\nRe-pulling from GBIF: ", gbif_outfile
       )
@@ -313,7 +331,15 @@ pull_gbif_clean <- function(species_name,
           licence_raw = as.character(licence_raw),
           licence_expected = !is.na(licence) & licence %in% expected_licences_gbif,
           identificationVerificationStatus = as.character(identificationVerificationStatus),
-          issues = as.character(issues)
+          issues = as.character(issues),
+          basisOfRecord = as.character(basisOfRecord),
+          taxonRank = as.character(taxonRank),
+          occurrenceStatus = as.character(occurrenceStatus),
+          datasetKey = as.character(datasetKey),
+          datasetName = as.character(datasetName),
+          publishingOrgKey = as.character(publishingOrgKey),
+          institutionCode = as.character(institutionCode),
+          collectionCode = as.character(collectionCode)
         )
       attr(gbif_clean, "gbif_status") <- list(
         state = "complete",
@@ -477,7 +503,16 @@ pull_gbif_clean <- function(species_name,
       "coordinateUncertaintyInMeters",
       "identificationVerificationStatus",
       "issues", "issue",
-      "identifiedBy", "dateIdentified"
+      "identifiedBy", "dateIdentified",
+      # Record type / provenance fields (used for Stage 03+ filtering/diagnostics)
+      "basisOfRecord",
+      "taxonRank",
+      "occurrenceStatus",
+      "datasetKey",
+      "datasetName",
+      "publishingOrgKey",
+      "institutionCode",
+      "collectionCode"
     )
     
     ct <- readr::cols(
@@ -495,6 +530,14 @@ pull_gbif_clean <- function(species_name,
       issue  = readr::col_character(),
       identifiedBy = readr::col_character(),
       dateIdentified = readr::col_character(),
+      basisOfRecord = readr::col_character(),
+      taxonRank = readr::col_character(),
+      occurrenceStatus = readr::col_character(),
+      datasetKey = readr::col_character(),
+      datasetName = readr::col_character(),
+      publishingOrgKey = readr::col_character(),
+      institutionCode = readr::col_character(),
+      collectionCode = readr::col_character(),
       .default = readr::col_character()
     )
     
@@ -528,6 +571,14 @@ pull_gbif_clean <- function(species_name,
     if (!"issues" %in% names(gbif_raw)) gbif_raw$issues <- NA_character_
     if (!"identifiedBy" %in% names(gbif_raw)) gbif_raw$identifiedBy <- NA_character_
     if (!"dateIdentified" %in% names(gbif_raw)) gbif_raw$dateIdentified <- NA_character_
+    if (!"basisOfRecord" %in% names(gbif_raw)) gbif_raw$basisOfRecord <- NA_character_
+    if (!"taxonRank" %in% names(gbif_raw)) gbif_raw$taxonRank <- NA_character_
+    if (!"occurrenceStatus" %in% names(gbif_raw)) gbif_raw$occurrenceStatus <- NA_character_
+    if (!"datasetKey" %in% names(gbif_raw)) gbif_raw$datasetKey <- NA_character_
+    if (!"datasetName" %in% names(gbif_raw)) gbif_raw$datasetName <- NA_character_
+    if (!"publishingOrgKey" %in% names(gbif_raw)) gbif_raw$publishingOrgKey <- NA_character_
+    if (!"institutionCode" %in% names(gbif_raw)) gbif_raw$institutionCode <- NA_character_
+    if (!"collectionCode" %in% names(gbif_raw)) gbif_raw$collectionCode <- NA_character_
     
     # -------------------------------------------------------------------------
     # Basic screening + essential fields (include QA/certainty fields)
@@ -555,7 +606,17 @@ pull_gbif_clean <- function(species_name,
         identificationVerificationStatus = as.character(identificationVerificationStatus),
         issues = as.character(issues),
         identifiedBy = as.character(identifiedBy),
-        dateIdentified = as.character(dateIdentified)
+        dateIdentified = as.character(dateIdentified),
+        
+        # Record type / provenance fields
+        basisOfRecord = as.character(basisOfRecord),
+        taxonRank = as.character(taxonRank),
+        occurrenceStatus = as.character(occurrenceStatus),
+        datasetKey = as.character(datasetKey),
+        datasetName = as.character(datasetName),
+        publishingOrgKey = as.character(publishingOrgKey),
+        institutionCode = as.character(institutionCode),
+        collectionCode = as.character(collectionCode)
       ) %>%
       filter(!is.na(lon), !is.na(lat))
     
@@ -774,6 +835,39 @@ pull_gbif_clean <- function(species_name,
       
       dateIdentified = if ("dateIdentified" %in% names(gbif_raw)) {
         as.character(dateIdentified)
+      } else NA_character_,
+      
+      # Record type / provenance fields
+      basisOfRecord = if ("basisOfRecord" %in% names(gbif_raw)) {
+        as.character(basisOfRecord)
+      } else NA_character_,
+      
+      taxonRank = if ("taxonRank" %in% names(gbif_raw)) {
+        as.character(taxonRank)
+      } else NA_character_,
+      
+      occurrenceStatus = if ("occurrenceStatus" %in% names(gbif_raw)) {
+        as.character(occurrenceStatus)
+      } else NA_character_,
+      
+      datasetKey = if ("datasetKey" %in% names(gbif_raw)) {
+        as.character(datasetKey)
+      } else NA_character_,
+      
+      datasetName = if ("datasetName" %in% names(gbif_raw)) {
+        as.character(datasetName)
+      } else NA_character_,
+      
+      publishingOrgKey = if ("publishingOrgKey" %in% names(gbif_raw)) {
+        as.character(publishingOrgKey)
+      } else NA_character_,
+      
+      institutionCode = if ("institutionCode" %in% names(gbif_raw)) {
+        as.character(institutionCode)
+      } else NA_character_,
+      
+      collectionCode = if ("collectionCode" %in% names(gbif_raw)) {
+        as.character(collectionCode)
       } else NA_character_
     ) %>%
     filter(!is.na(lon), !is.na(lat))
@@ -846,7 +940,7 @@ pull_gbif_clean <- function(species_name,
   
   return(gbif_clean)
 }
-  
+
 # ==============================================================================
 # NBN pull (UK Atlas) ----------------------------------------------------------
 # ==============================================================================
@@ -859,11 +953,11 @@ pull_nbn_clean <- function(species_name,
                            expected_licences_nbn = c("OGL", "CC0", "CC-BY", "CC-BY-NC"),
                            use_cache = TRUE,
                            pause_s = 0.25)
-                           {
+{
   
   repo_root <- get_repo_root()
   group_dir <- normalise_group_dir(group_dir)
-    nbn_out_root <- if (nzchar(group_dir)) {
+  nbn_out_root <- if (nzchar(group_dir)) {
     file.path(repo_root, "data", "raw", "nbn", group_dir)
   } else {
     file.path(repo_root, "data", "raw", "nbn")
@@ -908,7 +1002,17 @@ pull_nbn_clean <- function(species_name,
   required_cache_cols <- c(
     "coordinateUncertaintyInMeters",
     "identificationVerificationStatus",
-    "identifiedBy"
+    "identifiedBy",
+    "coordinatePrecision",
+    # Schema alignment / provenance fields (often NA for NBN, but kept for downstream consistency)
+    "basisOfRecord",
+    "taxonRank",
+    "occurrenceStatus",
+    "datasetKey",
+    "datasetName",
+    "publishingOrgKey",
+    "institutionCode",
+    "collectionCode"
   )
   
   # ---------------------------------------------------------------------------
@@ -932,7 +1036,7 @@ pull_nbn_clean <- function(species_name,
     
     if (length(missing_cols) > 0) {
       message(
-        "Found existing NBN clean file but it is missing new QA columns: ",
+        "Found existing NBN clean file but it is missing required columns for the current schema: ",
         paste(missing_cols, collapse = ", "),
         "\nRe-pulling from NBN: ", nbn_outfile
       )
@@ -947,7 +1051,15 @@ pull_nbn_clean <- function(species_name,
           licence_expected = !is.na(licence) & licence %in% expected_licences_nbn,
           identificationVerificationStatus = as.character(identificationVerificationStatus),
           identifiedBy = as.character(identifiedBy),
-          coordinatePrecision = as.character(coordinatePrecision)
+          coordinatePrecision = as.character(coordinatePrecision),
+          basisOfRecord = as.character(basisOfRecord),
+          taxonRank = as.character(taxonRank),
+          occurrenceStatus = as.character(occurrenceStatus),
+          datasetKey = as.character(datasetKey),
+          datasetName = as.character(datasetName),
+          publishingOrgKey = as.character(publishingOrgKey),
+          institutionCode = as.character(institutionCode),
+          collectionCode = as.character(collectionCode)
         )
     }
   }
@@ -1081,6 +1193,16 @@ pull_nbn_clean <- function(species_name,
     if (!"identificationVerificationStatus" %in% names(nbn_raw)) nbn_raw$identificationVerificationStatus <- NA_character_
     if (!"identifiedBy" %in% names(nbn_raw))                 nbn_raw$identifiedBy <- NA_character_
     
+    # Ensure schema alignment / provenance columns exist (NBN often cannot supply these)
+    if (!"basisOfRecord" %in% names(nbn_raw))     nbn_raw$basisOfRecord <- NA_character_
+    if (!"taxonRank" %in% names(nbn_raw))         nbn_raw$taxonRank <- NA_character_
+    if (!"occurrenceStatus" %in% names(nbn_raw))  nbn_raw$occurrenceStatus <- NA_character_
+    if (!"datasetKey" %in% names(nbn_raw))        nbn_raw$datasetKey <- NA_character_
+    if (!"datasetName" %in% names(nbn_raw))       nbn_raw$datasetName <- NA_character_
+    if (!"publishingOrgKey" %in% names(nbn_raw))  nbn_raw$publishingOrgKey <- NA_character_
+    if (!"institutionCode" %in% names(nbn_raw))   nbn_raw$institutionCode <- NA_character_
+    if (!"collectionCode" %in% names(nbn_raw))    nbn_raw$collectionCode <- NA_character_
+    
     message("NBN licence breakdown (RAW pull):")
     nbn_raw %>%
       count(.data[[lic_col]], sort = TRUE) %>%
@@ -1107,7 +1229,17 @@ pull_nbn_clean <- function(species_name,
         coordinateUncertaintyInMeters = as.numeric(coordinateUncertaintyInMeters),
         coordinatePrecision = as.character(coordinatePrecision),
         identificationVerificationStatus = as.character(identificationVerificationStatus),
-        identifiedBy = as.character(identifiedBy)
+        identifiedBy = as.character(identifiedBy),
+        
+        # Schema alignment / provenance fields (often NA for NBN)
+        basisOfRecord = as.character(basisOfRecord),
+        taxonRank = as.character(taxonRank),
+        occurrenceStatus = as.character(occurrenceStatus),
+        datasetKey = as.character(datasetKey),
+        datasetName = as.character(datasetName),
+        publishingOrgKey = as.character(publishingOrgKey),
+        institutionCode = as.character(institutionCode),
+        collectionCode = as.character(collectionCode)
       ) %>%
       filter(!is.na(lon), !is.na(lat))
     

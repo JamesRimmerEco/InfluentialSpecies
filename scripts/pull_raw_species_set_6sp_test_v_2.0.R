@@ -32,6 +32,11 @@ nbn_email <- "jamesrimmer92@mail.com"  # email used for NBN (galah) access
 
 # If we previously ran this before the QA columns were added, we keep TRUE:
 # the pull script will auto-repull if cached CSVs are missing the new QA columns.
+#
+# Patch note:
+#   Stage 00 now also retains record-type / provenance fields (e.g. basisOfRecord, taxonRank,
+#   occurrenceStatus, datasetKey, etc.). Older cached CSVs missing these will be treated as
+#   stale automatically and re-pulled when the upstream APIs are available.
 use_cache <- TRUE
 
 # write straight into data/raw/gbif and data/raw/nbn
