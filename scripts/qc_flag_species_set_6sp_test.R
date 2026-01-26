@@ -127,7 +127,7 @@ qc_flag_occurrences(
   group_dir                  = group_dir,
   in_root                    = file.path("data", "processed", "01_merged"),
   out_root                   = file.path("data", "processed", "02_qc_flagged"),
-  overwrite                  = FALSE,
+  overwrite                  = TRUE, # Slower but necessary if upstream data are updated
   refresh_if_inputs_newer    = TRUE,
   continue_on_error          = TRUE,
   max_coord_uncertainty_m    = max_coord_uncertainty_m,
