@@ -85,7 +85,8 @@ policy <- list(
   max_date = NA,                    # set NA to disable
   
   # If event_day is missing but a year is available, allow records to pass
-  # date filters using the year value only (e.g. year >= min_year).  allow_year_only = TRUE,
+  # date filters using the year value only (e.g. year >= min_year).
+  allow_year_only = TRUE,
   
   # If TRUE, drop any row without event_day regardless of year.
   require_event_day = FALSE,
