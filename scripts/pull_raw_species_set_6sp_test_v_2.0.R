@@ -62,3 +62,15 @@ pull_raw_occurrences(
   gbif_method        = "auto",
   gbif_download_wait = FALSE
 )
+
+# ---- Note on GBIF “EUROPE” filter (interpretation + caveats) ------------------
+# GBIF occurrences were downloaded using the GBIF occurrence API with
+# hasCoordinate=TRUE and continent="EUROPE" via the rgbif R package.
+#
+# IMPORTANT: GBIF’s “continent” is an interpreted field, derived primarily from
+# interpreted coordinates (reverse geocoding) and otherwise from interpreted
+# country. It may be left blank when indeterminate (and seas are not assigned a
+# continent), so filtering by continent can exclude some records that are
+# geographically in Europe but lack an interpreted continent value.
+#
+# So, it future might decide to set my own coordinate-based filtering rather than using the test case here.  
