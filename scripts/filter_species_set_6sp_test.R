@@ -55,7 +55,7 @@ policy <- list(
   # Unique label for this exact set of filtering rules.
   # Change this whenever you change ANY threshold/switch (e.g. uncertainty 1 km -> 5 km),
   # so run logs and outputs can be traced back to the policy that produced them.
-  policy_id = "baseline_2010_unc1km",
+  policy_id = "baseline_2010_unc1km_in_situ_obs_only_gbif",
   
   # Keep only selected sources (NULL keeps all).
   keep_sources = NULL,              # e.g. c("GBIF", "NBN")
@@ -134,6 +134,11 @@ policy <- list(
   drop_unexpected_licence = FALSE,
   
   # ---- basisOfRecord handling (optional; applies if basisOfRecord exists) -----
+  #
+  # NOTE:
+  # NBN often has basisOfRecord == NA, so we do NOT use allowed_basis_of_record/drop_basis_of_record
+  # globally here (that would accidentally drop large amounts of NBN).
+  # Instead we enforce an explicit "in situ observations only" rule for GBIF in extra_drop_rules below.
   
   allowed_basis_of_record = NULL,   # e.g. c("HUMAN_OBSERVATION","OBSERVATION","MACHINE_OBSERVATION")
   drop_basis_of_record = NULL,      # e.g. c("FOSSIL_SPECIMEN","PRESERVED_SPECIMEN")
@@ -152,6 +157,26 @@ policy <- list(
   
   # Named list of functions(dt) -> logical drop vector (TRUE means drop).
   extra_drop_rules = list(
+    # In situ / contemporary: drop any GBIF record that is not clearly an observation.
+    #
+    # We KEEP only:
+    #   - HUMAN_OBSERVATION
+    #   - OBSERVATION
+    #   - MACHINE_OBSERVATION
+    #
+    # We DROP anything else (e.g. PRESERVED_SPECIMEN, FOSSIL_SPECIMEN, LIVING_SPECIMEN,
+    # MATERIAL_SAMPLE, MATERIAL_CITATION, OCCURRENCE, etc.)
+    drop_gbif_non_observation_basis = function(dt) {
+      if (!("source" %in% names(dt)) || !("basisOfRecord" %in% names(dt))) {
+        return(rep(FALSE, nrow(dt)))
+      }
+      
+      bor <- toupper(trimws(as.character(dt$basisOfRecord)))
+      allowed <- c("HUMAN_OBSERVATION", "OBSERVATION", "MACHINE_OBSERVATION")
+      
+      dt$source == "GBIF" & !(bor %in% allowed)
+    }
+    
     # Example:
     # drop_pre2000_gbif = function(dt) {
     #   yr <- suppressWarnings(as.integer(dt$year))
@@ -159,7 +184,6 @@ policy <- list(
     # }
   )
 )
-
 
 # ==============================================================================
 # RUN SETTINGS
