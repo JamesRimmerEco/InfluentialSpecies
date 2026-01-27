@@ -121,7 +121,7 @@ merge_occurrences(
   group_dir               = group_dir,
   coord_round_dp          = coord_round_dp,
   prefer_source           = prefer_source,
-  overwrite               = TRUE, # runs slower, but important if raw pull are updated
+  overwrite               = TRUE, # runs slower, but important if raw pull are updated (harder force than below argument)
   refresh_if_inputs_newer = TRUE,   # key: re-run later to pick up newly arrived GBIF downloads
   continue_on_error       = TRUE
 )
