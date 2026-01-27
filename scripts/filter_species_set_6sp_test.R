@@ -219,3 +219,140 @@ stage03_filter_occurrences(
   continue_on_error = continue_on_error,
   verbose = verbose
 )
+
+# ==============================================================================
+# Quick Stage 03 “before vs after” + drop-reason summary (prints to console)
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+runlog_path <- file.path(repo_root, out_root, "_runlog_03_filtered.csv")
+
+if (!file.exists(runlog_path)) {
+  message("[Stage 03 summary] No runlog found at: ", runlog_path)
+} else {
+  
+  # Read header explicitly (helps keep fread() stable if the file has mixed column counts)
+  hdr <- strsplit(readLines(runlog_path, n = 1, warn = FALSE), ",", fixed = TRUE)[[1]]
+  
+  lg <- fread(
+    runlog_path,
+    sep = ",",
+    header = TRUE,
+    fill = TRUE,
+    quote = "\"",
+    na.strings = c("", "NA")
+  )
+  
+  # If some rows have an extra column (due to schema changes over time), name it harmlessly.
+  if (ncol(lg) > length(hdr)) {
+    setnames(lg, c(hdr, paste0("extra_col_", seq_len(ncol(lg) - length(hdr)))))
+  }
+  
+  if (!("timestamp_utc" %in% names(lg))) {
+    message(
+      "[Stage 03 summary] Runlog parsed unexpectedly (timestamp_utc missing).\n",
+      "If this persists, delete and regenerate the runlog:\n",
+      "  file.remove(runlog_path)\n",
+      "Then re-run Stage 03."
+    )
+  } else {
+    
+    # Parse timestamp (ISO UTC). Sorting the string often works too, but this is safer.
+    lg[, timestamp_utc_parsed := as.POSIXct(
+      timestamp_utc,
+      format = "%Y-%m-%dT%H:%M:%SZ",
+      tz = "UTC"
+    )]
+    
+    # Restrict to the species in THIS test script
+    slugify_local <- function(x) {
+      s <- gsub("[^a-z0-9]+", "_", tolower(x))
+      gsub("^_+|_+$", "", s)
+    }
+    slugs <- vapply(species_names, slugify_local, character(1))
+    lg <- lg[slug %in% slugs]
+    
+    # Prefer rows from the currently running policy; otherwise fall back to latest ok per species
+    lg_ok  <- lg[status == "ok" & !is.na(timestamp_utc_parsed)]
+    lg_pol <- lg_ok[policy_id == policy$policy_id]
+    
+    pick_latest <- function(dt) {
+      dt[order(timestamp_utc_parsed)][, .SD[.N], by = slug]
+    }
+    
+    latest <- if (nrow(lg_pol) > 0) pick_latest(lg_pol) else pick_latest(lg_ok)
+    
+    # Basic before/after table
+    latest[, n_in  := as.integer(n_in)]
+    latest[, n_out := as.integer(n_out)]
+    latest[, dropped_total := n_in - n_out]
+    latest[, kept_pct := round(100 * n_out / pmax(n_in, 1L), 1)]
+    
+    # Drop-reason columns (whatever exists in the current runlog)
+    drop_cols <- grep("^dropped_", names(latest), value = TRUE)
+    
+    # Top drop reason per species
+    #
+    # IMPORTANT:
+    # dropped_total is a derived summary (n_in - n_out) and will always be the largest
+    # if it is ever included in the comparison set. We explicitly exclude it here to ensure
+    # top_drop_reason reflects the single biggest driver among the logged drop columns.
+    drop_cols_for_top <- setdiff(drop_cols, "dropped_total")
+    
+    if (length(drop_cols_for_top) > 0) {
+      m <- as.matrix(latest[, ..drop_cols_for_top])
+      suppressWarnings(storage.mode(m) <- "numeric")
+      m[is.na(m)] <- 0
+      
+      max_n <- apply(m, 1, max)
+      idx   <- max.col(m, ties.method = "first")
+      
+      latest[, top_drop_n := as.integer(max_n)]
+      latest[, top_drop_reason := drop_cols_for_top[idx]]
+      
+      # If nothing was dropped for a species (all zeros), avoid reporting a misleading reason.
+      latest[top_drop_n == 0, top_drop_reason := NA_character_]
+    } else {
+      latest[, `:=`(top_drop_reason = NA_character_, top_drop_n = 0L)]
+    }
+    
+    cat("\n============================================================\n")
+    cat("Stage 03 summary (latest run per species)\n")
+    cat("Policy preference:", policy$policy_id, "\n")
+    cat("Runlog:", runlog_path, "\n")
+    cat("============================================================\n\n")
+    
+    print(latest[, .(
+      species, slug, policy_id,
+      n_in, n_out, kept_pct, dropped_total,
+      top_drop_reason, top_drop_n
+    )][order(-dropped_total)])
+    
+    # Totals across all species
+    cat("\n-- Totals across these species (latest rows) --\n")
+    print(latest[, .(
+      n_in = sum(n_in, na.rm = TRUE),
+      n_out = sum(n_out, na.rm = TRUE),
+      dropped_total = sum(dropped_total, na.rm = TRUE),
+      kept_pct = round(100 * sum(n_out, na.rm = TRUE) / pmax(sum(n_in, na.rm = TRUE), 1), 1)
+    )])
+    
+    # Aggregate drop reasons (top 12)
+    if (length(drop_cols) > 0) {
+      reason_totals <- latest[, lapply(.SD, function(x) sum(as.numeric(x), na.rm = TRUE)), .SDcols = drop_cols]
+      reason_totals <- melt(reason_totals, measure.vars = names(reason_totals),
+                            variable.name = "reason", value.name = "n_dropped")[order(-n_dropped)]
+      
+      cat("\n-- Drop reasons (summed across these species; latest rows) --\n")
+      print(reason_totals[n_dropped > 0][1:min(12, .N)])
+    }
+    
+    cat("\nNote: if you encounter intermittent parsing issues when reading the runlog, it is safe to delete and regenerate it.\n")
+    cat("This will not affect any processed datasets; it only recreates the log file.\n")
+    cat("  # file.remove(runlog_path)\n")
+    
+  }
+}
