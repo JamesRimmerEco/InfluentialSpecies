@@ -1,0 +1,317 @@
+---
+title: "Influential Species — Pipeline transparency"
+subtitle: "GBIF + NBN occurrences → QC flags → policy filter → gridded presence/background"
+author: "James Rimmer"
+date: "2026-02-02"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    page-layout: full
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Purpose
+
+This document explains, in plain English, what happens at each stage of the **InfluentialSpecies** pipeline.
+
+It focuses on:
+
+-   what each stage does,
+-   what files are produced, and
+-   which choices (assumptions / judgement calls) are being made.
+
+The aim is to make the workflow easy to understand for any reader, while remaining precise enough that decisions can be discussed and revised.
+
+## Pipeline overview
+
+::: callout-note
+## What the pipeline does
+
+For each species, we download occurrence records from GBIF (Europe-wide first pass) and from the UK NBN Atlas. We then combine those sources, apply a set of quality-control checks (which *flag* possible issues rather than deleting records), apply a policy definition for “usable” records for modelling, and finally convert the remaining point records into a gridded presence/background format.
+
+We work with "engine" scripts in /R, which do the heavy lifting, and "wrapper" scripts in /scripts, which are shorter, easier to work with, and can be easily customised with different species sets, filtering policies, tests etc. Outputs are saved to raw and processed file locations.
+
+Where the term "slug" is used, it indicates a file or folder name written to be easily read by a human rather than a computer. Specifically, slug is a placeholder for the Latin name of a given species.
+:::
+
+### Stages at a glance
+
+| Stage | Plain-language description | Main output folder |
+|------------------------|------------------------|------------------------|
+| **Stage 00 — Raw pull** | Download GBIF + NBN occurrence records for a species list and save them to disk | `data/raw/` |
+| **Stage 01 — Merge** | Combine GBIF + NBN into a single per-species table (keeping provenance) | `data/processed/01_merged/` |
+| **Stage 02 — QC flags** | Run QC checks and add flags (do not delete records here) | `data/processed/02_qc_flagged/` |
+| **Stage 03 — Policy filter** | Apply a clear “in/out” policy for modelling (e.g., contemporary in-situ observations vs live specimens or fossils) | `data/processed/03_filtered/` |
+| **Stage 04 — Grid** | Convert point records into a gridded presence/background representation | `data/processed/04_grid/` |
+
+::: {.callout-tip collapse="true"}
+## Flowchart
+
+``` mermaid
+flowchart TD
+  A[Stage 00: Raw pull
+Download GBIF + NBN records] --> B[Stage 01: Merge
+Combine sources into one table]
+  B --> C[Stage 02: QC flags
+Add QC flags (mostly no dropping)]
+  C --> D[Stage 03: Policy filter
+Apply modelling policy (in/out)]
+  D --> E[Stage 04: Grid
+Make 25 km (or other) grid tables/rasters]
+```
+:::
+
+## How to read this document
+
+Each stage includes:
+
+-   **What it does** (plain language explanation)
+-   **Inputs and outputs** (what information goes in and what files are produced)
+-   **Key choices** (decisions that matter and affect outputs)
+-   **Where it is implemented** (the relevant code locations, helpful for using the repository)
+
+```{r}
+# ==============================================================================
+# Small helpers used to keep parts of this document auto-updating.
+# These are intentionally minimal and are not required reading.
+# ==============================================================================
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+repo_root <- normalizePath(getwd())
+
+# Read only column names from a CSV quickly (no full data load)
+csv_cols <- function(path) {
+  if (!file.exists(path)) return(character())
+  names(fread(path, nrows = 0))
+}
+
+# Find the first matching file under a directory
+first_file <- function(dir_path, pattern) {
+  if (!dir.exists(dir_path)) return(NA_character_)
+  hits <- list.files(dir_path, pattern = pattern, recursive = TRUE, full.names = TRUE)
+  if (length(hits) == 0) return(NA_character_)
+  hits[[1]]
+}
+
+# Pretty, compact file path (relative if possible)
+rel_path <- function(p) {
+  if (is.na(p) || !nzchar(p)) return(NA_character_)
+  p <- normalizePath(p, winslash = "/", mustWork = FALSE)
+  root <- normalizePath(repo_root, winslash = "/", mustWork = FALSE)
+  if (startsWith(p, root)) sub(paste0("^", root, "/"), "", p) else p
+}
+```
+
+# Stage 00 — Raw occurrence pull (GBIF Europe + NBN UK)
+
+::: callout-note
+## What this stage does
+
+Occurrence records are downloaded for a defined list of species from:
+
+-   **GBIF** (Europe-wide first pass), and
+-   **NBN Atlas** (UK).
+
+Outputs are saved per species and per source in a consistent table format. These raw files are kept as the “ground truth” input for everything downstream.
+:::
+
+::: callout-tip
+## Where it is implemented
+
+-   Engine function: `R/pull_raw_occurrences.R`
+-   Example wrapper: `scripts/pull_raw_species_set_6sp_test_v_2.0.R`
+:::
+
+## Inputs
+
+-   **Species list** (Latin names).
+-   **NBN Atlas login details** (used by the `galah` package). In practice this means an account with:
+    -   username,
+    -   password, and
+    -   the email address associated with the account.
+-   **GBIF approach** (two methods are supported; see below).
+-   **Cache setting** (whether to reuse previously downloaded raw files).
+
+::: callout-important
+## GBIF is downloaded in two different ways
+
+GBIF can return very large numbers of records. This pipeline supports two approaches, chosen automatically (or explicitly):
+
+-   **Small/medium pulls (below \~100,000 rows):** the “standard API query” route.
+-   **Large pulls (above \~100,000 rows):** the “GBIF download” route (asynchronous download).
+
+The download route may require a GBIF account (username + password) if the code is set to use authenticated downloads.
+:::
+
+## Outputs
+
+Raw outputs are written as CSVs to:
+
+-   `data/raw/gbif/<species_slug>/gbif_<species_slug>_clean.csv`
+-   `data/raw/nbn/<species_slug>/nbn_<species_slug>_clean.csv`
+
+Each file is “one row per record”, with columns that include:
+
+-   coordinates (longitude/latitude),
+-   dates,
+-   provenance fields (source identifiers), and
+-   record-type fields needed for later policy decisions (for example, the type of record and dataset information).
+
+## Key choices (Stage 00)
+
+### 00A — Spatial scope for the GBIF pull
+
+-   The current first pass uses GBIF’s interpreted field `continent = "EUROPE"`, alongside `hasCoordinate = TRUE`.
+-   This is a pragmatic modelling extent for an initial Europe-wide run, and can be revisited later.
+
+### 00B — Caching (why it exists, and what it does)
+
+Pulling data from GBIF and NBN can be slow, rate-limited, or occasionally fail due to temporary API issues.
+
+-   When **caching is ON**, the pipeline will **reuse** existing raw output files if they already exist.
+-   If required columns are missing (for example, because the pipeline has been updated to retain more fields), the cached file is treated as **stale** and the data are re-downloaded.
+-   When **caching is OFF**, the pipeline forces a fresh pull every time.
+
+This makes runs reproducible and helps avoid repeatedly hammering external APIs.
+
+::: {.callout-important collapse="true"}
+## Output columns written (what this section is trying to show)
+
+This section is here for transparency.
+
+Rather than asking readers to open raw CSVs, the document can list the *fields that are being retained* at Stage 00. That helps answer questions like:
+
+-   “Are we keeping enough information to justify later policy decisions?”
+-   “Has the set of fields changed since the last run?”
+-   “What information will Forestry England (or other collaborators) actually see in the exported tables?”
+
+The list below is auto-detected from one example GBIF raw output and one example NBN raw output **if those files exist on disk**.
+
+```{r results='asis'}
+# Locate example raw files (any species)
+gbif_dir <- file.path(repo_root, "data", "raw", "gbif")
+nbn_dir  <- file.path(repo_root, "data", "raw", "nbn")
+
+gbif_example <- first_file(gbif_dir, pattern = "^gbif_.*_clean[.]csv$")
+nbn_example  <- first_file(nbn_dir,  pattern = "^nbn_.*_clean[.]csv$")
+
+cat("**Where this is looking:**
+
+")
+cat("- GBIF: `", rel_path(gbif_dir), "`
+", sep = "")
+cat("- NBN:  `", rel_path(nbn_dir), "`
+
+", sep = "")
+
+if (is.na(gbif_example)) {
+  cat("**GBIF example file:** not found yet (Stage 00 may not have been run on this machine).
+
+")
+} else {
+  cat("**GBIF example file:** `", rel_path(gbif_example), "`
+
+", sep = "")
+}
+
+if (is.na(nbn_example)) {
+  cat("**NBN example file:** not found yet (Stage 00 may not have been run on this machine).
+
+")
+} else {
+  cat("**NBN example file:** `", rel_path(nbn_example), "`
+
+", sep = "")
+}
+
+# Column lists
+gbif_cols <- if (!is.na(gbif_example)) csv_cols(gbif_example) else character()
+nbn_cols  <- if (!is.na(nbn_example))  csv_cols(nbn_example)  else character()
+
+if (length(gbif_cols) > 0) {
+  cat("### GBIF fields retained at Stage 00
+
+")
+  cat(paste0("- `", gbif_cols, "`
+"), sep = "")
+  cat("
+")
+}
+
+if (length(nbn_cols) > 0) {
+  cat("### NBN fields retained at Stage 00
+
+")
+  cat(paste0("- `", nbn_cols, "`
+"), sep = "")
+  cat("
+")
+}
+```
+:::
+
+## Notes on GBIF “Europe” filter
+
+GBIF’s `continent` field is interpreted (primarily from interpreted coordinates, otherwise interpreted country). Records with indeterminate continent (or records at sea) may not be assigned a continent value and can be excluded by this filter.
+
+If this becomes an issue for a particular species (e.g., coastal or island records), the spatial scope can be replaced with an explicit coordinate-based bounding box filter.
+
+# Stage 01 — Merge (placeholder)
+
+::: callout-note
+## What this stage will describe
+
+How GBIF and NBN records are combined per species into a single table, while retaining source/provenance fields.
+:::
+
+-   Engine function: (to fill)
+-   Example wrapper: (to fill)
+-   Outputs: `data/processed/01_merged/<species_slug>/...`
+
+# Stage 02 — QC flagging (placeholder)
+
+::: callout-note
+## What this stage will describe
+
+Which QC checks are applied (for example: missing coordinates, out-of-range coordinates, missing or implausible dates, high coordinate uncertainty).
+
+The intent is generally to **flag** records rather than drop them at this step.
+:::
+
+-   Engine function: (to fill)
+-   Example wrapper: (to fill)
+-   Outputs: `data/processed/02_qc_flagged/<species_slug>/...`
+
+# Stage 03 — Policy filter (placeholder)
+
+::: callout-note
+## What this stage will describe
+
+The policy definition used to decide which records are kept for modelling.
+
+This includes the “in situ observation” requirement (especially for GBIF) and the rationale for any date / uncertainty constraints.
+:::
+
+-   Engine function: (to fill)
+-   Example wrapper: (to fill)
+-   Outputs: `data/processed/03_filtered/<species_slug>/...`
+
+# Stage 04 — Grid (placeholder)
+
+::: callout-note
+## What this stage will describe
+
+How point records are converted into a gridded presence/background representation (including CRS choice, modelling extent, grid resolution, and any land masking).
+:::
+
+-   Engine function: (to fill)
+-   Example wrapper: (to fill)
+-   Outputs: `data/processed/04_grid/<policy_tag>/...`
