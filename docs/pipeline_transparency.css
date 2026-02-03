@@ -1,0 +1,11 @@
+/* Make mermaid diagrams fill the available width */
+.mermaid svg {
+  width: 100% !important;
+  height: auto !important;
+  max-width: 100% !important;
+}
+
+/* Slightly larger labels inside diagrams */
+.mermaid {
+  font-size: 1.1rem;
+}
