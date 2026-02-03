@@ -14,7 +14,8 @@
 #    Save outputs for each species:
 #    If species_subdir = TRUE: data/raw/gbif/<group_dir>/<slug>/gbif_<slug>_clean.csv
 #
-#    If species_subdir = FALSE: data/raw/gbif/<group_dir>/gbif_<slug>_clean.csv (or directly data/raw #    /gbif/... if group_dir is blank)
+#    If species_subdir = FALSE: data/raw/gbif/<group_dir>/gbif_<slug>_clean.csv (or directly data/raw
+#    /gbif/... if group_dir is blank)
 #
 #   Save checkpoints to:
 #     data/_checkpoints/gbif/gbif_pull_checkpoint_<slug>.rds
@@ -69,7 +70,7 @@
 #   - If cached *_clean.csv files were created before the QA fields were added,
 #     this script will automatically treat them as stale and re-pull (probably only
 #     will occur for wasps, or if we decide to add more columns).
-# ------------------------------------------------------------------------------ 
+# ------------------------------------------------------------------------------
 
 
 suppressPackageStartupMessages({
@@ -84,6 +85,18 @@ suppressPackageStartupMessages({
 
 # ---- Helper: load local (gitignored) credentials if present -------------------
 load_local_gbif_credentials <- function(repo_root) {
+  
+  # >>> PATCH A: "cloud-safe" behaviour (env vars win) <<<
+  # If GBIF creds are already present in the environment (e.g. set in the console
+  # for this session), do NOT load any local credentials file that could overwrite them.
+  if (nzchar(Sys.getenv("GBIF_USER")) &&
+      nzchar(Sys.getenv("GBIF_PWD")) &&
+      nzchar(Sys.getenv("GBIF_EMAIL"))) {
+    message("GBIF credentials already set in environment; skipping credentials file.")
+    return(invisible(TRUE))
+  }
+  # >>> END PATCH A <<<
+  
   candidates <- c(
     file.path(repo_root, "credentials.R"),
     file.path(repo_root, "data", "credentials.R")
@@ -231,7 +244,6 @@ pull_gbif_clean <- function(species_name,
       TRUE ~ NA_character_
     )
   }
-  
   
   # Columns that MUST exist in cached outputs to be considered "current schema"
   required_cache_cols <- c(
@@ -754,8 +766,26 @@ pull_gbif_clean <- function(species_name,
       ckpt$all_pages <- all_pages
       ckpt$complete <- FALSE
       ckpt$last_updated <- as.character(Sys.time())
+      ckpt$last_error <- conditionMessage(res)
       saveRDS(ckpt, ckpt_file)
-      stop(res)
+      
+      # >>> PATCH B: do not crash the entire wrapper run <<<
+      message(
+        "\n[GBIF][INCOMPLETE] Failed after retries for ", species_name, " at start=", start, ".\n",
+        "  Error: ", conditionMessage(res), "\n",
+        "Skipping for now — re-run later to resume.\n"
+      )
+      
+      gbif_clean <- empty_gbif_clean()
+      attr(gbif_clean, "gbif_status") <- list(
+        state = "error_retry_exhausted",
+        method = "search",
+        expected = total_expected,
+        start = start,
+        error = conditionMessage(res)
+      )
+      return(gbif_clean)
+      # >>> END PATCH B <<<
     }
     
     # Total expected from meta if occ_count failed earlier
@@ -790,10 +820,14 @@ pull_gbif_clean <- function(species_name,
   message("GBIF rows pulled (paged):  ", nrow(gbif_raw))
   
   message("GBIF licence breakdown (RAW pull):")
-  gbif_raw %>%
-    count(license, sort = TRUE) %>%
-    mutate(prop = n / sum(n)) %>%
-    print(n = 10)
+  if (nrow(gbif_raw) > 0) {
+    gbif_raw %>%
+      count(license, sort = TRUE) %>%
+      mutate(prop = n / sum(n)) %>%
+      print(n = 10)
+  } else {
+    message("[GBIF] No rows returned in search pull.")
+  }
   
   # -------------------------------------------------------------------------
   # Basic screening + essential fields (include QA/certainty fields)
@@ -898,39 +932,43 @@ pull_gbif_clean <- function(species_name,
   # ---------------------------------------------------------------------------
   # Licence flagging
   # ---------------------------------------------------------------------------
-  unexpected_tbl <- gbif_clean %>%
-    mutate(
-      licence = as.character(licence),
-      licence_raw = as.character(licence_raw),
-      licence_expected = !is.na(licence) & licence %in% expected_licences_gbif
-    ) %>%
-    filter(!licence_expected) %>%
-    count(licence_raw, licence, sort = TRUE) %>%
-    mutate(
-      species = species_name,
-      source = "GBIF",
-      prop_of_records = n / nrow(gbif_clean)
-    )
-  
-  if (nrow(unexpected_tbl) > 0) {
-    message("\n[LICENCE FLAG] GBIF returned licence types outside the expected set for ", species_name, ".")
-    message("Expected (normalised): ", paste(expected_licences_gbif, collapse = ", "))
-    message("Top unexpected licence entries (see log for full list):")
-    print(head(unexpected_tbl, 10), n = 10)
+  if (nrow(gbif_clean) > 0) {
+    unexpected_tbl <- gbif_clean %>%
+      mutate(
+        licence = as.character(licence),
+        licence_raw = as.character(licence_raw),
+        licence_expected = !is.na(licence) & licence %in% expected_licences_gbif
+      ) %>%
+      filter(!licence_expected) %>%
+      count(licence_raw, licence, sort = TRUE) %>%
+      mutate(
+        species = species_name,
+        source = "GBIF",
+        prop_of_records = n / nrow(gbif_clean)
+      )
     
-    write_unexpected_licence_log(
-      species_name = species_name,
-      slug = slug,
-      source_name = "GBIF",
-      unexpected_tbl = unexpected_tbl,
-      repo_root = repo_root
-    )
+    if (nrow(unexpected_tbl) > 0) {
+      message("\n[LICENCE FLAG] GBIF returned licence types outside the expected set for ", species_name, ".")
+      message("Expected (normalised): ", paste(expected_licences_gbif, collapse = ", "))
+      message("Top unexpected licence entries (see log for full list):")
+      print(head(unexpected_tbl, 10), n = 10)
+      
+      write_unexpected_licence_log(
+        species_name = species_name,
+        slug = slug,
+        source_name = "GBIF",
+        unexpected_tbl = unexpected_tbl,
+        repo_root = repo_root
+      )
+    } else {
+      message("[LICENCE OK] GBIF: no unexpected licence types detected for ", species_name, ".")
+    }
   } else {
-    message("[LICENCE OK] GBIF: no unexpected licence types detected for ", species_name, ".")
+    message("[GBIF] No records returned after coordinate screening; skipping licence checks.")
   }
   
   message("GBIF clean: ", nrow(gbif_clean), " records.")
-  gbif_clean %>% count(licence, sort = TRUE) %>% print(n = 10)
+  if (nrow(gbif_clean) > 0) gbif_clean %>% count(licence, sort = TRUE) %>% print(n = 10)
   
   attr(gbif_clean, "gbif_status") <- list(
     state = if (isTRUE(ckpt$complete)) "complete" else "incomplete",
@@ -1015,15 +1053,34 @@ pull_nbn_clean <- function(species_name,
     "collectionCode"
   )
   
-  # ---------------------------------------------------------------------------
-  # NBN taxon check (kept as-is)
-  # ---------------------------------------------------------------------------
-  nbn_taxa <- search_taxa(species_name)
-  message("NBN taxon search (top hit):")
-  nbn_taxa %>%
-    select(scientific_name, taxon_concept_id, rank) %>%
-    head(1) %>%
-    print(n = 1)
+  # Always return a tibble with the expected schema (even if 0 rows)
+  empty_nbn_clean <- function() {
+    tibble::tibble(
+      source = character(),
+      species = character(),
+      recordID = character(),
+      lon = numeric(),
+      lat = numeric(),
+      date = character(),
+      year = integer(),
+      licence_raw = character(),
+      licence = character(),
+      licence_expected = logical(),
+      coordinateUncertaintyInMeters = numeric(),
+      coordinatePrecision = character(),
+      identificationVerificationStatus = character(),
+      identifiedBy = character(),
+      # Schema alignment / provenance fields (often NA for NBN)
+      basisOfRecord = character(),
+      taxonRank = character(),
+      occurrenceStatus = character(),
+      datasetKey = character(),
+      datasetName = character(),
+      publishingOrgKey = character(),
+      institutionCode = character(),
+      collectionCode = character()
+    )
+  }
   
   # ---------------------------------------------------------------------------
   # NBN occurrence pull (cached if available + schema matches)
@@ -1061,209 +1118,260 @@ pull_nbn_clean <- function(species_name,
           institutionCode = as.character(institutionCode),
           collectionCode = as.character(collectionCode)
         )
+      
+      # Licence flagging (cached)
+      if (nrow(nbn_clean) == 0) {
+        message("[NBN] Cached file is empty; skipping licence checks.")
+        message("NBN clean: 0 records.")
+        return(nbn_clean)
+      }
     }
   }
   
+  # ---------------------------------------------------------------------------
+  # NBN taxon check (kept as-is, but now used as a strict guardrail)
+  # ---------------------------------------------------------------------------
   if (!use_cached) {
     
-    max_retries <- 5
-    retry_base_wait_s <- 10
+    nbn_taxa <- search_taxa(species_name)
+    message("NBN taxon search (top hit):")
+    nbn_taxa %>%
+      select(scientific_name, taxon_concept_id, rank) %>%
+      head(1) %>%
+      print(n = 1)
     
-    # Prefer a checkpoint, but only if it has the new QA fields
-    nbn_raw <- NULL
-    if (file.exists(nbn_ckpt_file)) {
-      message("Found NBN checkpoint, loading: ", nbn_ckpt_file)
-      tmp <- readRDS(nbn_ckpt_file)
+    # >>> PATCH C: strict match guard to prevent near-matches (e.g. Ursus -> Arctoa) <<<
+    # We ONLY proceed if NBN taxonomy contains an exact (case-insensitive) species-rank match.
+    nbn_exact <- nbn_taxa %>%
+      filter(tolower(scientific_name) == tolower(species_name),
+             tolower(rank) == "species")
+    
+    if (nrow(nbn_exact) == 0) {
+      message(
+        "[NBN] No exact species match for '", species_name, "' in NBN taxonomy.\n",
+        "      This can happen for non-UK taxa, spelling/synonym differences, or absent taxa.\n",
+        "      Skipping NBN pull and writing an empty output (schema-correct) so the pipeline can continue."
+      )
       
-      has_license <- ("dcterms:license" %in% names(tmp)) || ("license" %in% names(tmp))
-      has_required <- all(c("recordID", "scientificName", "eventDate", "year",
-                            "decimalLatitude", "decimalLongitude") %in% names(tmp))
-      has_qa <- all(required_cache_cols %in% names(tmp))
-      
-      if (has_license && has_required && has_qa) {
-        nbn_raw <- tmp
-      } else {
-        message("Checkpoint exists but is missing QA columns; re-downloading.")
-        nbn_raw <- NULL
-      }
+      nbn_clean <- empty_nbn_clean()
+      readr::write_csv(nbn_clean, nbn_outfile)
+      message("Saved NBN clean file (EMPTY): ", nbn_outfile)
+      return(nbn_clean)
     }
+    # >>> END PATCH C <<<
+  }
+  
+  # If we got here, we either:
+  #   - have no cache and have passed the strict taxon guard, OR
+  #   - had cache but it was stale and we are re-pulling.
+  
+  max_retries <- 5
+  retry_base_wait_s <- 10
+  
+  # Prefer a checkpoint, but only if it has the new QA fields
+  nbn_raw <- NULL
+  if (file.exists(nbn_ckpt_file)) {
+    message("Found NBN checkpoint, loading: ", nbn_ckpt_file)
+    tmp <- readRDS(nbn_ckpt_file)
     
-    # If no usable checkpoint, download with retries
-    if (is.null(nbn_raw)) {
+    has_license <- ("dcterms:license" %in% names(tmp)) || ("license" %in% names(tmp))
+    has_required <- all(c("recordID", "scientificName", "eventDate", "year",
+                          "decimalLatitude", "decimalLongitude") %in% names(tmp))
+    has_qa <- all(required_cache_cols %in% names(tmp))
+    
+    if (has_license && has_required && has_qa) {
+      nbn_raw <- tmp
+    } else {
+      message("Checkpoint exists but is missing QA columns; re-downloading.")
+      nbn_raw <- NULL
+    }
+  }
+  
+  # If no usable checkpoint, download with retries
+  if (is.null(nbn_raw)) {
+    
+    # Field sets (avoid the known 403 fields: dateIdentified, basisOfRecord, occurrenceStatus)
+    nbn_core <- c(
+      "recordID",
+      "scientificName",
+      "eventDate",
+      "year",
+      "decimalLatitude",
+      "decimalLongitude",
+      "license"
+    )
+    
+    nbn_qa <- c(
+      "coordinateUncertaintyInMeters",
+      "coordinatePrecision",
+      "identificationVerificationStatus",
+      "identifiedBy"
+    )
+    
+    make_select <- function(x) do.call(galah::galah_select, as.list(x))
+    
+    for (attempt in seq_len(max_retries)) {
       
-      # Field sets (avoid the known 403 fields: dateIdentified, basisOfRecord, occurrenceStatus)
-      nbn_core <- c(
-        "recordID",
-        "scientificName",
-        "eventDate",
-        "year",
-        "decimalLatitude",
-        "decimalLongitude",
-        "license"
+      Sys.sleep(pause_s)
+      
+      # 1) Try core + QA in one call
+      nbn_raw_try <- tryCatch(
+        galah_call() |>
+          galah_identify(species_name) |>
+          atlas_occurrences(select = make_select(c(nbn_core, nbn_qa))),
+        error = function(e) e
       )
       
-      nbn_qa <- c(
-        "coordinateUncertaintyInMeters",
-        "coordinatePrecision",
-        "identificationVerificationStatus",
-        "identifiedBy"
+      if (!inherits(nbn_raw_try, "error")) {
+        nbn_raw <- nbn_raw_try
+        break
+      }
+      
+      # 2) Fallback: core-only + QA-only (join on recordID)
+      message(
+        "NBN combined (core+QA) pull failed (attempt ", attempt, "/", max_retries, "): ",
+        conditionMessage(nbn_raw_try),
+        "\nTrying fallback: core-only + QA-only join..."
       )
       
-      make_select <- function(x) do.call(galah::galah_select, as.list(x))
+      core_try <- tryCatch(
+        galah_call() |>
+          galah_identify(species_name) |>
+          atlas_occurrences(select = make_select(nbn_core)),
+        error = function(e) e
+      )
       
-      for (attempt in seq_len(max_retries)) {
+      if (!inherits(core_try, "error")) {
         
-        Sys.sleep(pause_s)
-        
-        # 1) Try core + QA in one call
-        nbn_raw_try <- tryCatch(
+        qa_try <- tryCatch(
           galah_call() |>
             galah_identify(species_name) |>
-            atlas_occurrences(select = make_select(c(nbn_core, nbn_qa))),
+            atlas_occurrences(select = make_select(c("recordID", nbn_qa))),
           error = function(e) e
         )
         
-        if (!inherits(nbn_raw_try, "error")) {
-          nbn_raw <- nbn_raw_try
+        if (!inherits(qa_try, "error")) {
+          qa_try <- qa_try %>% distinct(recordID, .keep_all = TRUE)
+          nbn_raw <- core_try %>% left_join(qa_try, by = "recordID")
+          break
+        } else {
+          message("Fallback QA-only pull failed: ", conditionMessage(qa_try))
+          # proceed with core only; we'll add QA columns as NA later
+          nbn_raw <- core_try
           break
         }
         
-        # 2) Fallback: core-only + QA-only (join on recordID)
+      } else {
+        wait_s <- retry_base_wait_s * attempt
         message(
-          "NBN combined (core+QA) pull failed (attempt ", attempt, "/", max_retries, "): ",
-          conditionMessage(nbn_raw_try),
-          "\nTrying fallback: core-only + QA-only join..."
+          "NBN core pull also failed (attempt ", attempt, "/", max_retries, "): ",
+          conditionMessage(core_try),
+          " | waiting ", wait_s, "s then retrying..."
         )
-        
-        core_try <- tryCatch(
-          galah_call() |>
-            galah_identify(species_name) |>
-            atlas_occurrences(select = make_select(nbn_core)),
-          error = function(e) e
-        )
-        
-        if (!inherits(core_try, "error")) {
-          
-          qa_try <- tryCatch(
-            galah_call() |>
-              galah_identify(species_name) |>
-              atlas_occurrences(select = make_select(c("recordID", nbn_qa))),
-            error = function(e) e
-          )
-          
-          if (!inherits(qa_try, "error")) {
-            qa_try <- qa_try %>% distinct(recordID, .keep_all = TRUE)
-            nbn_raw <- core_try %>% left_join(qa_try, by = "recordID")
-            break
-          } else {
-            message("Fallback QA-only pull failed: ", conditionMessage(qa_try))
-            # proceed with core only; we'll add QA columns as NA later
-            nbn_raw <- core_try
-            break
-          }
-          
-        } else {
-          wait_s <- retry_base_wait_s * attempt
-          message(
-            "NBN core pull also failed (attempt ", attempt, "/", max_retries, "): ",
-            conditionMessage(core_try),
-            " | waiting ", wait_s, "s then retrying..."
-          )
-          Sys.sleep(wait_s)
-        }
+        Sys.sleep(wait_s)
       }
-      
-      if (is.null(nbn_raw)) stop("NBN pull failed after retries for: ", species_name)
-      
-      # Save raw pull to checkpoint so we don't need to re-download next time
-      saveRDS(nbn_raw, nbn_ckpt_file)
-      message("Saved NBN checkpoint: ", nbn_ckpt_file)
     }
     
-    message("NBN raw rows: ", nrow(nbn_raw))
+    if (is.null(nbn_raw)) stop("NBN pull failed after retries for: ", species_name)
     
-    # -------------------------------------------------------------------------
-    # Record check + cleaning (NBN) (UPDATED: include QA/certainty fields)
-    # -------------------------------------------------------------------------
-    lic_col <- if ("dcterms:license" %in% names(nbn_raw)) "dcterms:license" else "license"
-    
-    # Ensure QA columns exist even if the fallback ran core-only
-    if (!"coordinateUncertaintyInMeters" %in% names(nbn_raw)) nbn_raw$coordinateUncertaintyInMeters <- NA_real_
-    if (!"coordinatePrecision" %in% names(nbn_raw))          nbn_raw$coordinatePrecision <- NA_character_
-    if (!"identificationVerificationStatus" %in% names(nbn_raw)) nbn_raw$identificationVerificationStatus <- NA_character_
-    if (!"identifiedBy" %in% names(nbn_raw))                 nbn_raw$identifiedBy <- NA_character_
-    
-    # Ensure schema alignment / provenance columns exist (NBN often cannot supply these)
-    if (!"basisOfRecord" %in% names(nbn_raw))     nbn_raw$basisOfRecord <- NA_character_
-    if (!"taxonRank" %in% names(nbn_raw))         nbn_raw$taxonRank <- NA_character_
-    if (!"occurrenceStatus" %in% names(nbn_raw))  nbn_raw$occurrenceStatus <- NA_character_
-    if (!"datasetKey" %in% names(nbn_raw))        nbn_raw$datasetKey <- NA_character_
-    if (!"datasetName" %in% names(nbn_raw))       nbn_raw$datasetName <- NA_character_
-    if (!"publishingOrgKey" %in% names(nbn_raw))  nbn_raw$publishingOrgKey <- NA_character_
-    if (!"institutionCode" %in% names(nbn_raw))   nbn_raw$institutionCode <- NA_character_
-    if (!"collectionCode" %in% names(nbn_raw))    nbn_raw$collectionCode <- NA_character_
-    
+    # Save raw pull to checkpoint so we don't need to re-download next time
+    saveRDS(nbn_raw, nbn_ckpt_file)
+    message("Saved NBN checkpoint: ", nbn_ckpt_file)
+  }
+  
+  message("NBN raw rows: ", nrow(nbn_raw))
+  
+  # -------------------------------------------------------------------------
+  # Record check + cleaning (NBN) (UPDATED: include QA/certainty fields)
+  # -------------------------------------------------------------------------
+  lic_col <- if ("dcterms:license" %in% names(nbn_raw)) "dcterms:license" else "license"
+  
+  # Ensure QA columns exist even if the fallback ran core-only
+  if (!"coordinateUncertaintyInMeters" %in% names(nbn_raw)) nbn_raw$coordinateUncertaintyInMeters <- NA_real_
+  if (!"coordinatePrecision" %in% names(nbn_raw))          nbn_raw$coordinatePrecision <- NA_character_
+  if (!"identificationVerificationStatus" %in% names(nbn_raw)) nbn_raw$identificationVerificationStatus <- NA_character_
+  if (!"identifiedBy" %in% names(nbn_raw))                 nbn_raw$identifiedBy <- NA_character_
+  
+  # Ensure schema alignment / provenance columns exist (NBN often cannot supply these)
+  if (!"basisOfRecord" %in% names(nbn_raw))     nbn_raw$basisOfRecord <- NA_character_
+  if (!"taxonRank" %in% names(nbn_raw))         nbn_raw$taxonRank <- NA_character_
+  if (!"occurrenceStatus" %in% names(nbn_raw))  nbn_raw$occurrenceStatus <- NA_character_
+  if (!"datasetKey" %in% names(nbn_raw))        nbn_raw$datasetKey <- NA_character_
+  if (!"datasetName" %in% names(nbn_raw))       nbn_raw$datasetName <- NA_character_
+  if (!"publishingOrgKey" %in% names(nbn_raw))  nbn_raw$publishingOrgKey <- NA_character_
+  if (!"institutionCode" %in% names(nbn_raw))   nbn_raw$institutionCode <- NA_character_
+  if (!"collectionCode" %in% names(nbn_raw))    nbn_raw$collectionCode <- NA_character_
+  
+  if (nrow(nbn_raw) > 0) {
     message("NBN licence breakdown (RAW pull):")
     nbn_raw %>%
       count(.data[[lic_col]], sort = TRUE) %>%
       mutate(prop = n / sum(n)) %>%
       print(n = 10)
-    
-    nbn_clean <- nbn_raw %>%
-      transmute(
-        source = "NBN",
-        species = species_name,
-        recordID = as.character(recordID),
-        lon = decimalLongitude,
-        lat = decimalLatitude,
-        date = as.character(eventDate),
-        year = as.integer(year),
-        
-        # Licence fields (no filtering)
-        licence_raw = as.character(.data[[lic_col]]),
-        licence = lic_normalise_nbn(.data[[lic_col]]),
-        licence_expected = !is.na(lic_normalise_nbn(.data[[lic_col]])) &
-          lic_normalise_nbn(.data[[lic_col]]) %in% expected_licences_nbn,
-        
-        # QA / certainty fields (NEW)
-        coordinateUncertaintyInMeters = as.numeric(coordinateUncertaintyInMeters),
-        coordinatePrecision = as.character(coordinatePrecision),
-        identificationVerificationStatus = as.character(identificationVerificationStatus),
-        identifiedBy = as.character(identifiedBy),
-        
-        # Schema alignment / provenance fields (often NA for NBN)
-        basisOfRecord = as.character(basisOfRecord),
-        taxonRank = as.character(taxonRank),
-        occurrenceStatus = as.character(occurrenceStatus),
-        datasetKey = as.character(datasetKey),
-        datasetName = as.character(datasetName),
-        publishingOrgKey = as.character(publishingOrgKey),
-        institutionCode = as.character(institutionCode),
-        collectionCode = as.character(collectionCode)
-      ) %>%
-      filter(!is.na(lon), !is.na(lat))
-    
-    message("NBN rows (raw -> screened coords only): ", nrow(nbn_raw), " -> ", nrow(nbn_clean))
-    
-    # -------------------------------------------------------------------------
-    # De-duplication (NBN; light-touch)
-    # -------------------------------------------------------------------------
-    n_before <- nrow(nbn_clean)
-    
-    nbn_clean <- nbn_clean %>%
-      distinct(recordID, .keep_all = TRUE) %>%
-      distinct(lon, lat, date, .keep_all = TRUE)
-    
-    message("NBN rows (screened -> de-dup): ", n_before, " -> ", nrow(nbn_clean))
-    
-    # Save output (NBN)
-    write_csv(nbn_clean, nbn_outfile)
-    message("Saved NBN clean file: ", nbn_outfile)
+  } else {
+    message("[NBN] No rows returned (0 UK records is plausible for non-native taxa).")
   }
+  
+  nbn_clean <- nbn_raw %>%
+    transmute(
+      source = "NBN",
+      species = species_name,
+      recordID = as.character(recordID),
+      lon = decimalLongitude,
+      lat = decimalLatitude,
+      date = as.character(eventDate),
+      year = as.integer(year),
+      
+      # Licence fields (no filtering)
+      licence_raw = as.character(.data[[lic_col]]),
+      licence = lic_normalise_nbn(.data[[lic_col]]),
+      licence_expected = !is.na(lic_normalise_nbn(.data[[lic_col]])) &
+        lic_normalise_nbn(.data[[lic_col]]) %in% expected_licences_nbn,
+      
+      # QA / certainty fields (NEW)
+      coordinateUncertaintyInMeters = as.numeric(coordinateUncertaintyInMeters),
+      coordinatePrecision = as.character(coordinatePrecision),
+      identificationVerificationStatus = as.character(identificationVerificationStatus),
+      identifiedBy = as.character(identifiedBy),
+      
+      # Schema alignment / provenance fields (often NA for NBN)
+      basisOfRecord = as.character(basisOfRecord),
+      taxonRank = as.character(taxonRank),
+      occurrenceStatus = as.character(occurrenceStatus),
+      datasetKey = as.character(datasetKey),
+      datasetName = as.character(datasetName),
+      publishingOrgKey = as.character(publishingOrgKey),
+      institutionCode = as.character(institutionCode),
+      collectionCode = as.character(collectionCode)
+    ) %>%
+    filter(!is.na(lon), !is.na(lat))
+  
+  message("NBN rows (raw -> screened coords only): ", nrow(nbn_raw), " -> ", nrow(nbn_clean))
+  
+  # -------------------------------------------------------------------------
+  # De-duplication (NBN; light-touch)
+  # -------------------------------------------------------------------------
+  n_before <- nrow(nbn_clean)
+  
+  nbn_clean <- nbn_clean %>%
+    distinct(recordID, .keep_all = TRUE) %>%
+    distinct(lon, lat, date, .keep_all = TRUE)
+  
+  message("NBN rows (screened -> de-dup): ", n_before, " -> ", nrow(nbn_clean))
+  
+  # Save output (NBN)
+  write_csv(nbn_clean, nbn_outfile)
+  message("Saved NBN clean file: ", nbn_outfile)
   
   # ---------------------------------------------------------------------------
   # Licence flagging
   # ---------------------------------------------------------------------------
+  if (nrow(nbn_clean) == 0) {
+    message("[NBN] No records after coordinate screening; skipping licence checks.")
+    message("NBN clean: 0 records.")
+    return(nbn_clean)
+  }
+  
   unexpected_tbl <- nbn_clean %>%
     mutate(
       licence = as.character(licence),
@@ -1382,6 +1490,7 @@ pull_raw_occurrences <- function(species_names,
       if (!is.null(s$key) && !is.na(s$key) && nzchar(s$key)) line <- paste0(line, " (key=", s$key, ")")
       if (!is.null(s$status) && !is.na(s$status) && nzchar(s$status)) line <- paste0(line, " status=", s$status)
       if (!is.null(s$expected) && !is.na(s$expected)) line <- paste0(line, " expected=", s$expected)
+      if (!is.null(s$start) && !is.na(s$start)) line <- paste0(line, " start=", s$start)
       message(line)
     }
     message("\nRe-run the script later to resume any pending GBIF downloads.")
