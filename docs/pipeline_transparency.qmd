@@ -22,9 +22,9 @@ execute:
 
 ## Purpose
 
-This document is a plain-language record of the key choices made in the **InfluentialSpecies** repository pipeline.
+This document is a record of the key choices made in the **InfluentialSpecies** repository pipeline.
 
-It is written to be understandable to someone who has never used R. Script names are provided for traceability, but the focus is on *what decisions are being made and why*.
+Script names are provided for traceability, but the focus is on *what decisions are being made and why* rather than detailing coding steps.
 
 ## Pipeline overview
 
@@ -54,7 +54,7 @@ flowchart TB
   A["Stage 00 — Raw pull<br/>Download GBIF (Europe) + NBN (UK)"] --> B["Stage 01 — Merge<br/>Combine sources; remove only safest 1-to-1 duplicates"]
   B --> C["Stage 02 — QC flags<br/>Add QC flags; do not delete records here"]
   C --> D["Stage 03 — Policy filter<br/>Apply modelling policy (explicit 'in/out' rules)"]
-  D --> E["Stage 04 — Grid<br/>Convert points to grid (presence/background)"]
+  D --> E["Stage 04 — Grid<br/>Points → regular grid (presence/count) + background grid"]
 ```
 
 ::: {.callout-tip title="Making the diagram larger (CSS)"}
@@ -91,7 +91,7 @@ Create this file in the same folder as this `.qmd` (typically `docs/pipeline_tra
 | **Stage 01 — Merge** | Combine GBIF + NBN into one table per species; drop only the safest 1-to-1 duplicates | `data/processed/01_merged/` |
 | **Stage 02 — QC flags** | Add QC flag columns (no deletion here) | `data/processed/02_qc_flagged/` |
 | **Stage 03 — Policy filter** | Apply an explicit modelling policy (the “in/out” definition) | `data/processed/03_filtered/` |
-| **Stage 04 — Grid** | Convert points into gridded presence/background | `data/processed/04_grid/` |
+| **Stage 04 — Grid** | Convert filtered points into a regular grid (presence/count) and a background grid | `data/processed/04_grid/` |
 
 ------------------------------------------------------------------------
 
@@ -116,13 +116,13 @@ It writes a “raw-clean” file per species per source, with basic coordinate u
 
 Different sources and query sizes can require different access steps:
 
--   **NBN Atlas (UK):** requires an account and login details (typically email/username + password).\
+-   **NBN Atlas (UK):** requires an account and login details (email, username and password).\
     These are used by `galah` to access and download data.
 
 -   **GBIF (Europe):** can be retrieved in two ways:
 
     -   **Direct API pull** for smaller result sets (fast; typically used under \~100,000 rows).
-    -   **GBIF download job** for larger result sets (asynchronous; may require GBIF credentials and can take time to complete).
+    -   **GBIF download job** for larger result sets (asynchronous; requires GBIF credentials and can take time to complete).
 
 The Stage 00 wrapper controls which method is used (e.g. `gbif_method = "auto"`) and whether to wait for large downloads to complete (e.g. `gbif_download_wait`).
 
@@ -131,7 +131,7 @@ The Stage 00 wrapper controls which method is used (e.g. `gbif_method = "auto"`)
 Stage 00 can re-use previously downloaded CSVs to avoid repeatedly querying GBIF/NBN.
 
 -   If `use_cache = TRUE`, existing raw-clean CSVs are used when present.
--   Caching is **not blind**. If older cached files are missing newly-added QA/provenance fields (columns introduced in later revisions of the pull engine), they are treated as **stale** and will be re-pulled automatically when the upstream APIs are available.
+-   Caching is **not blind**. If older cached files are missing newly-added QA/provenance fields (columns introduced in later revisions of the pull engine), they are treated as **stale** and will be re-pulled automatically when the upstream APIs are available (unless this is disabled).
 
 This prevents the pipeline silently running on outdated raw outputs after the pull stage has been improved.
 
@@ -191,7 +191,7 @@ tibble(
 
 GBIF records are pulled using `hasCoordinate=TRUE` and `continent="EUROPE"`.
 
-**Caveat:** GBIF’s `continent` is an interpreted field and may be blank when indeterminate (and seas are not assigned a continent). Filtering by continent can therefore exclude some records that are geographically in Europe but have no interpreted continent value.
+**Caveat:** GBIF’s `continent` is an interpreted field and may be blank when indeterminate (and seas are not assigned a continent). Filtering by continent can therefore exclude some records that are geographically in Europe but have no interpreted continent value - though this is apparently unlikely to be an issue (I am no more likely to flag a record as European than the GBIF system itself was).
 
 If needed later, the pipeline can switch to explicit coordinate-based spatial filtering rather than relying on GBIF’s interpreted continent field.
 
@@ -275,11 +275,11 @@ Stage 02 flags potential issues; Stage 03 is where records are removed according
 -   **Example wrapper:** `scripts/filter_species_set_6sp_test.R`
 -   **Inputs:** `data/processed/02_qc_flagged/<species_slug>/occ_<species_slug>__qc_flagged.(parquet|rds)`
 -   **Outputs:** `data/processed/03_filtered/<species_slug>/occ_<species_slug>__filtered.(parquet|rds)`
--   **Run log (recommended):** `data/processed/03_filtered/_runlog_03_filtered.csv`
+-   **Run log:** `data/processed/03_filtered/_runlog_03_filtered.csv`
 
 ## What gets decided here
 
-Stage 03 is where the modelling definition is made concrete. Typical choices include:
+Stage 03 is where the filtering choices are defined. Typical choices we can filter on include:
 
 -   **Time window:** what counts as “contemporary” (e.g. keep only records after a start date).
 -   **Spatial reliability:** acceptable coordinate uncertainty (and what to do when uncertainty is missing).
@@ -298,7 +298,7 @@ The wrapper defines a single `policy <- list(...)` acting as a control panel. Th
 | Policy element | What it controls | Notes |
 |------------------------|------------------------|------------------------|
 | `drop_missing_coords` | drop rows with missing lon/lat | usually TRUE |
-| `drop_coords_out_of_range` | drop impossible lon/lat values | usually TRUE |
+| `drop_coords_out_of_range` | drop impossible lon/lat values | usually TRUE (unlikely to occur) |
 | `drop_future_date` | drop future-dated records | usually TRUE |
 | `drop_missing_date` | drop rows with no event day and no year | often FALSE |
 | `min_date`, `max_date` | date window applied to `event_day` | set to NA to disable |
@@ -339,19 +339,139 @@ This is the main audit trail for “what changed?” discussions, and supports r
 
 ------------------------------------------------------------------------
 
-# Stage 04 — Grid (to fill next)
+# Stage 04 — Grid (points → regular grid)
 
-::: {.callout-note title="What this stage will describe"}
-Stage 04 converts filtered point records into gridded presence/background.
+::: {.callout-note title="What this stage does"}
+Stage 04 converts Stage 03 point occurrences into a **regular grid** that can be used as a consistent modelling unit.
 
-This includes choices such as grid resolution (e.g. 25 km), coordinate system, modelling extent (bounding box), and optional land masking.
+For each species, the output grid covers the study extent and provides:
+
+-   **presence** (1 if the species is recorded at least once in the cell, otherwise 0), and
+-   **count** (how many points fell in the cell).
+
+This is still presence-only data: a 0 means “no record in that cell”, not “truly absent”.
 :::
 
--   **Expected output root:** `data/processed/04_grid/`\
-    (subfolders can capture the grid specification, e.g. `grid25km_test_landmask_europe_bbox`)
+-   **Engine script:** `R/grid_occurrences_stage03.R`\
+    (main entry point `grid_stage03_to_grid()`; optional utility `plot_europe_bbox_map()`)
+-   **Example wrapper:** `scripts/grid_stage03_25km_test.R`\
+    (the file name can vary; it is the “control panel” script that sets the settings)
 
--   **Engine script:** (to fill)
+## Output folder structure
 
--   **Wrapper script:** (to fill)
+Stage 04 writes to a generic stage folder, with the specific grid choices stored as a subfolder label:
 
--   **Outputs:** (to fill)
+-   Stage folder: `data/processed/04_grid/`
+-   Grid specification subfolder: `data/processed/04_grid/<policy_tag>/`
+
+Example used in the test wrapper:
+
+-   `policy_tag = "grid25km_test_landmask_europe_bbox"`
+
+This keeps the stage name stable (`04_grid`) while allowing multiple grid configurations to exist side-by-side (different resolutions, extents, land masks, etc.).
+
+## Key choices made in Stage 04
+
+### 1) Grid resolution
+
+-   `cell_km` sets grid cell size (e.g. 25 km).
+
+25 km is a practical first-pass resolution for Europe-wide modelling, and can be revisited later.
+
+### 2) Coordinate system
+
+The grid is built in a metric European projection:
+
+-   `crs_grid = "EPSG:3035"` (ETRS89 / LAEA Europe)
+
+This ensures 25 km is 25,000 metres everywhere. Using degrees would produce uneven cell sizes.
+
+### 3) Study extent (bounding box)
+
+A simple “Europe-ish” bounding box in lon/lat defines the study area:
+
+-   `bbox_ll = list(xmin = -25, xmax = 45, ymin = 34, ymax = 72)`
+
+This is a practical modelling extent for pipeline development, not a strict definition of Europe.
+
+### 4) Land mask (optional)
+
+If `use_land_mask = TRUE`, the background grid removes obvious ocean cells using a fast heuristic:
+
+-   keep a grid cell if the **cell centre point** falls on land polygons (Natural Earth).
+
+This is intentionally simple. Coastal edge cells may be imperfect, but it removes most ocean clutter for terrestrial modelling.
+
+### 5) Optional context map (quality check)
+
+If `plot_bbox_map = TRUE`, the stage writes a context map showing the world outline and the bounding box, to confirm the study extent is sensible.
+
+## What Stage 04 outputs
+
+### Outputs written once per grid specification
+
+Written under: `data/processed/04_grid/<policy_tag>/`
+
+-   `grid<cell_km>km_land_cells.parquet` (or `.csv` if `arrow` is not installed)\
+    A table of all land grid cells, including: `cell_id, row, col, x_center, y_center, on_land`
+
+-   `_summary_grid.csv`\
+    A simple per-species summary including how many points were read, how many were in bounds, and how many presence cells were created.
+
+-   `bbox_context_map.png` (only if `plot_bbox_map = TRUE`)\
+    A visual check of the extent (with the bounding box drawn).
+
+### Outputs written per species
+
+Written under: `data/processed/04_grid/<policy_tag>/<species_slug>/`
+
+-   `occ_<species_slug>__grid<cell_km>km.parquet` (or `.csv`)\
+    One row per land grid cell, including: `cell_id, row, col, x_center, y_center, lon_center, lat_center, n_points_in_cell, presence`
+
+-   Optional rasters (only if `terra` is installed and `write_geotiff = TRUE`):
+
+    -   `presence_<cell_km>km.tif` (1 / 0 / NA)
+    -   `count_<cell_km>km.tif` (counts / NA)
+
+Raster values mean:
+
+-   `NA` = not part of the modelling grid (e.g. sea cells if land mask is on)\
+-   `0` = land cell, but no record for this species\
+-   `1` = land cell with at least one record (presence)
+
+## How points become grid cells (plain language)
+
+For each species, Stage 04 does:
+
+1.  Read the Stage 03 filtered dataset for that species.
+2.  Keep only coordinates and drop missing coordinates.
+3.  Convert lon/lat into EPSG:3035 metres.
+4.  Assign each point to a row/column grid index.
+5.  Count points per cell (`n_points_in_cell`).
+6.  Convert counts to presence (`presence = 1` if count \> 0 else 0).
+7.  Join the results to the full land grid to produce a complete background + presence table.
+
+## Practical sanity checks after running
+
+-   Do presence cells look geographically sensible (not scattered into the sea)?
+-   Is `sum(n_points_in_cell)` similar to the number of Stage 03 rows with coordinates?
+-   If most points fall outside the grid, the bounding box is likely too tight or in the wrong place.
+
+------------------------------------------------------------------------
+
+## Quick local check: do Stage 04 outputs exist?
+
+```{r}
+root_04 <- file.path("data", "processed", "04_grid")
+if (!dir.exists(root_04)) {
+  tibble::tibble(stage04_found = FALSE, note = "No data/processed/04_grid folder found yet.")
+} else {
+  # Show the first few grid-spec folders if present
+  specs <- list.dirs(root_04, full.names = FALSE, recursive = FALSE)
+  tibble::tibble(
+    stage04_found = TRUE,
+    n_grid_specs = length(specs),
+    grid_specs = paste(head(specs, 8), collapse = ", ")
+  )
+}
+```
