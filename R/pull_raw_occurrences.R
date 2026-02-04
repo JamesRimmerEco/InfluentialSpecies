@@ -1,27 +1,33 @@
 # InfluentialSpecies — pull raw occurrences (GBIF + NBN Atlas) -------------------
 #
-# Purpose:
+# Purpose
 #   Pull occurrence data for one or more species from:
 #     - GBIF (Europe-wide scope, via rgbif)
 #     - NBN Atlas (UK-only, via galah)
 #
-#   Apply only very basic screening suitable for raw outputs:
-#     - keep only records with usable coordinates (no geographical context is not useful)
-#     - light-touch within-source de-duplication only (exact duplicates):
+#   Apply only very basic screening suitable for "raw" outputs:
+#     - keep only records with usable coordinates
+#     - light-touch, within-source de-duplication only (exact duplicates):
 #         GBIF: duplicate gbifID, and exact repeats of (lon, lat, date)
 #         NBN : duplicate recordID, and exact repeats of (lon, lat, date)
 #
-#    Save outputs for each species:
-#    If species_subdir = TRUE: data/raw/gbif/<group_dir>/<slug>/gbif_<slug>_clean.csv
+# Outputs
+#   For each species we write a per-source "clean" CSV:
 #
-#    If species_subdir = FALSE: data/raw/gbif/<group_dir>/gbif_<slug>_clean.csv (or directly data/raw
-#    /gbif/... if group_dir is blank)
+#   If species_subdir = TRUE:
+#     data/raw/gbif/<group_dir>/<slug>/gbif_<slug>_clean.csv
+#     data/raw/nbn/<group_dir>/<slug>/nbn_<slug>_clean.csv
 #
-#   Save checkpoints to:
+#   If species_subdir = FALSE:
+#     data/raw/gbif/<group_dir>/gbif_<slug>_clean.csv   (or data/raw/gbif/... if group_dir is blank)
+#     data/raw/nbn/<group_dir>/nbn_<slug>_clean.csv     (or data/raw/nbn/...  if group_dir is blank)
+#
+# Checkpoints
+#   Checkpoints are stored to support resuming long or asynchronous pulls:
 #     data/_checkpoints/gbif/gbif_pull_checkpoint_<slug>.rds
 #     data/_checkpoints/nbn/nbn_pull_checkpoint_<slug>.rds
 #
-# How GBIF pulls work (important):
+# How GBIF pulls work (important)
 #   - GBIF "search" (occ_search) is hard-limited to 100,000 records per query.
 #   - This script checks the expected GBIF record count per species:
 #       * If <= 100,000: it uses occ_search paging and writes the CSV immediately.
@@ -38,13 +44,13 @@
 #   - Once a species is complete (CSV exists AND checkpoint is marked complete),
 #     re-running does NOT re-download or re-pull that species; it is treated as cached.
 #
-# Typical usage:
-#   - You usually run this via a wrapper script in /scripts/ (e.g. pull_raw_species_set_*.R)
+# Typical usage
+#   - You usually run this via a wrapper script in /scripts/ (e.g. pull_raw_species_set_*.R).
 #   - If no species exceed 100k, one run is enough.
 #   - If any species exceed 100k, you may need to re-run the wrapper script one or more
 #     times until the final "GBIF WARNING" list disappears (all downloads completed).
 #
-# QA / certainty fields included in the "raw clean" outputs (NEW):
+# QA / certainty fields included in the "raw clean" outputs
 #   GBIF:
 #     - coordinateUncertaintyInMeters
 #     - identificationVerificationStatus
@@ -57,21 +63,17 @@
 #     - identifiedBy
 #     - coordinatePrecision (often NA, but included if selectable)
 #
-# Licence handling:
-#   We allow all licences (no licence-based filtering).
-#   However, we still define "expected" licence sets for each source, and if any
-#   other licence types appear we:
+# Licence handling
+#   We do not filter by licence at this stage.
+#   However, we still define "expected" licence sets for each source and, if any other
+#   licence types appear, we:
 #     (i) flag this clearly to the console, and
 #     (ii) write a per-species log file under data/raw/licence_flags/
-#   These log files are only created when unexpected licence types are
-#   present (if there are none, this will never appear).
 #
-# Notes:
-#   - If cached *_clean.csv files were created before the QA fields were added,
-#     this script will automatically treat them as stale and re-pull (probably only
-#     will occur for wasps, or if we decide to add more columns).
+# Notes
+#   - If cached *_clean.csv files were created before key fields were added (e.g. QA/provenance),
+#     this script treats them as stale and will re-pull.
 # ------------------------------------------------------------------------------
-
 
 suppressPackageStartupMessages({
   library(dplyr)
@@ -86,16 +88,15 @@ suppressPackageStartupMessages({
 # ---- Helper: load local (gitignored) credentials if present -------------------
 load_local_gbif_credentials <- function(repo_root) {
   
-  # >>> PATCH A: "cloud-safe" behaviour (env vars win) <<<
-  # If GBIF creds are already present in the environment (e.g. set in the console
-  # for this session), do NOT load any local credentials file that could overwrite them.
+  # If credentials are already present in the environment (e.g. set in the console for
+  # this session, or provided via .Renviron), do not load a local credentials file that
+  # could overwrite them.
   if (nzchar(Sys.getenv("GBIF_USER")) &&
       nzchar(Sys.getenv("GBIF_PWD")) &&
       nzchar(Sys.getenv("GBIF_EMAIL"))) {
     message("GBIF credentials already set in environment; skipping credentials file.")
     return(invisible(TRUE))
   }
-  # >>> END PATCH A <<<
   
   candidates <- c(
     file.path(repo_root, "credentials.R"),
@@ -146,15 +147,13 @@ load_local_gbif_credentials(repo_root)
 
 # ---- Helper: slugify a species name ------------------------------------------
 slugify_species <- function(species_name) {
+  # A simple, filesystem-safe species "slug" used for filenames and subfolders.
   slug <- str_replace_all(tolower(species_name), "[^a-z0-9]+", "_")
   slug <- str_replace_all(slug, "^_+|_+$", "")
   slug
 }
 
-# "Slugify" - just means creating a user-friendly descriptive domain, easier to read
-# than codes.
-
-# ---- Helper: Make group_dir robust when blank --------------------------------
+# ---- Helper: make group_dir robust when blank --------------------------------
 normalise_group_dir <- function(x) {
   if (is.null(x) || length(x) == 0 || is.na(x) || !nzchar(x)) "" else x
 }
@@ -215,17 +214,17 @@ pull_gbif_clean <- function(species_name,
   dir.create(gbif_out_root, recursive = TRUE, showWarnings = FALSE)
   dir.create(gbif_ckpt_dir, recursive = TRUE, showWarnings = FALSE)
   
-  # Species subfolder
+  # Species subfolder (optional)
   gbif_out_dir <- if (isTRUE(species_subdir)) file.path(gbif_out_root, slug) else gbif_out_root
   dir.create(gbif_out_dir, recursive = TRUE, showWarnings = FALSE)
   
   # Clean output file (used as a cache when re-running)
   gbif_outfile <- file.path(gbif_out_dir, paste0("gbif_", slug, "_clean.csv"))
   
-  # Checkpoint file (also stores download keys + completion state)
+  # Checkpoint file (stores download keys + completion state)
   ckpt_file <- file.path(gbif_ckpt_dir, paste0("gbif_pull_checkpoint_", slug, ".rds"))
   
-  # Licence normaliser (GBIF uses URLs with 'licenses' in the path, but can accept codes as well)
+  # Licence normaliser (GBIF uses URL forms in occ_search; download files may already have codes)
   lic_normalise_gbif <- function(x) {
     x_chr <- as.character(x)
     x_up  <- toupper(x_chr)
@@ -245,7 +244,7 @@ pull_gbif_clean <- function(species_name,
     )
   }
   
-  # Columns that MUST exist in cached outputs to be considered "current schema"
+  # Columns that must exist in cached outputs to be considered the current schema
   required_cache_cols <- c(
     "coordinateUncertaintyInMeters",
     "identificationVerificationStatus",
@@ -293,7 +292,7 @@ pull_gbif_clean <- function(species_name,
     )
   }
   
-  # Load / initialise checkpoint (backward compatible with older ckpt schema)
+  # Load / initialise checkpoint (backward compatible with older checkpoint schema)
   ckpt <- list(
     schema_version = 2,
     mode = NA_character_,          # "search" or "download"
@@ -360,7 +359,6 @@ pull_gbif_clean <- function(species_name,
       return(gbif_clean)
     } else {
       message("Found existing GBIF clean file, but checkpoint is not marked complete; verifying completeness...")
-      # We'll fall through and decide what to do based on record count + method
       use_cached <- FALSE
     }
   }
@@ -395,13 +393,12 @@ pull_gbif_clean <- function(species_name,
     }
   }
   
-  # If user forced "search" but count suggests it will be capped, switch to download (to ensure full data).
+  # If user forced "search" but count suggests it will be capped, switch to downloads (to ensure full data)
   if (gbif_method == "search" && !is.na(total_expected) && total_expected > gbif_search_hard_limit) {
     message("[GBIF] Count exceeds ", gbif_search_hard_limit, ". occ_search() cannot retrieve >100k; switching to downloads.")
     gbif_method <- "download"
   }
   
-  # Helper for safe credential check
   have_gbif_creds <- function() {
     nzchar(gbif_user) && nzchar(gbif_pwd) && nzchar(gbif_email)
   }
@@ -516,7 +513,7 @@ pull_gbif_clean <- function(species_name,
       "identificationVerificationStatus",
       "issues", "issue",
       "identifiedBy", "dateIdentified",
-      # Record type / provenance fields (used for Stage 03+ filtering/diagnostics)
+      # Record type / provenance fields
       "basisOfRecord",
       "taxonRank",
       "occurrenceStatus",
@@ -593,7 +590,7 @@ pull_gbif_clean <- function(species_name,
     if (!"collectionCode" %in% names(gbif_raw)) gbif_raw$collectionCode <- NA_character_
     
     # -------------------------------------------------------------------------
-    # Basic screening + essential fields (include QA/certainty fields)
+    # Basic screening + essential fields
     # -------------------------------------------------------------------------
     gbif_clean <- gbif_raw %>%
       transmute(
@@ -769,7 +766,8 @@ pull_gbif_clean <- function(species_name,
       ckpt$last_error <- conditionMessage(res)
       saveRDS(ckpt, ckpt_file)
       
-      # >>> PATCH B: do not crash the entire wrapper run <<<
+      # If retries are exhausted, return an empty result for this species so that
+      # multi-species wrapper runs can continue (and the species can be resumed later).
       message(
         "\n[GBIF][INCOMPLETE] Failed after retries for ", species_name, " at start=", start, ".\n",
         "  Error: ", conditionMessage(res), "\n",
@@ -785,7 +783,6 @@ pull_gbif_clean <- function(species_name,
         error = conditionMessage(res)
       )
       return(gbif_clean)
-      # >>> END PATCH B <<<
     }
     
     # Total expected from meta if occ_count failed earlier
@@ -830,7 +827,7 @@ pull_gbif_clean <- function(species_name,
   }
   
   # -------------------------------------------------------------------------
-  # Basic screening + essential fields (include QA/certainty fields)
+  # Basic screening + essential fields
   # -------------------------------------------------------------------------
   gbif_clean <- gbif_raw %>%
     transmute(
@@ -1010,7 +1007,7 @@ pull_nbn_clean <- function(species_name,
   dir.create(nbn_out_root, recursive = TRUE, showWarnings = FALSE)
   dir.create(nbn_ckpt_dir, recursive = TRUE, showWarnings = FALSE)
   
-  # Species subfolder (NEW)
+  # Species subfolder (optional)
   nbn_out_dir <- if (isTRUE(species_subdir)) file.path(nbn_out_root, slug) else nbn_out_root
   dir.create(nbn_out_dir, recursive = TRUE, showWarnings = FALSE)
   
@@ -1036,7 +1033,7 @@ pull_nbn_clean <- function(species_name,
     )
   }
   
-  # Columns that MUST exist in cached outputs to be considered "current schema"
+  # Columns that must exist in cached outputs to be considered the current schema
   required_cache_cols <- c(
     "coordinateUncertaintyInMeters",
     "identificationVerificationStatus",
@@ -1119,7 +1116,6 @@ pull_nbn_clean <- function(species_name,
           collectionCode = as.character(collectionCode)
         )
       
-      # Licence flagging (cached)
       if (nrow(nbn_clean) == 0) {
         message("[NBN] Cached file is empty; skipping licence checks.")
         message("NBN clean: 0 records.")
@@ -1129,46 +1125,77 @@ pull_nbn_clean <- function(species_name,
   }
   
   # ---------------------------------------------------------------------------
-  # NBN taxon check (kept as-is, but now used as a strict guardrail)
+  # NBN taxon guard
+  #   We proceed only if NBN taxonomy contains an exact, species-rank match.
+  #   This reduces the chance of pulling near-matches or surprising synonyms.
+  #   If there is no exact match, we write an empty (schema-correct) CSV and continue.
   # ---------------------------------------------------------------------------
   if (!use_cached) {
     
     nbn_taxa <- search_taxa(species_name)
     message("NBN taxon search (top hit):")
-    nbn_taxa %>%
-      select(scientific_name, taxon_concept_id, rank) %>%
-      head(1) %>%
-      print(n = 1)
     
-    # >>> PATCH C: strict match guard to prevent near-matches (e.g. Ursus -> Arctoa) <<<
-    # We ONLY proceed if NBN taxonomy contains an exact (case-insensitive) species-rank match.
-    nbn_exact <- nbn_taxa %>%
-      filter(tolower(scientific_name) == tolower(species_name),
-             tolower(rank) == "species")
-    
-    if (nrow(nbn_exact) == 0) {
-      message(
-        "[NBN] No exact species match for '", species_name, "' in NBN taxonomy.\n",
-        "      This can happen for non-UK taxa, spelling/synonym differences, or absent taxa.\n",
-        "      Skipping NBN pull and writing an empty output (schema-correct) so the pipeline can continue."
-      )
-      
-      nbn_clean <- empty_nbn_clean()
-      readr::write_csv(nbn_clean, nbn_outfile)
-      message("Saved NBN clean file (EMPTY): ", nbn_outfile)
-      return(nbn_clean)
+    if (inherits(nbn_taxa, "data.frame")) {
+      nbn_taxa %>%
+        dplyr::select(dplyr::any_of(c("scientific_name", "scientificName",
+                                      "taxon_concept_id", "taxonConceptId",
+                                      "rank"))) %>%
+        head(1) %>%
+        print(n = 1)
+    } else {
+      print(utils::head(nbn_taxa, 1))
     }
-    # >>> END PATCH C <<<
+    
+    # Normalise the columns we need for matching (different galah versions can vary)
+    nbn_taxa2 <- nbn_taxa
+    
+    if (inherits(nbn_taxa2, "data.frame")) {
+      
+      # scientific name
+      if (!"scientific_name" %in% names(nbn_taxa2)) {
+        if ("scientificName" %in% names(nbn_taxa2)) {
+          nbn_taxa2$scientific_name <- nbn_taxa2$scientificName
+        } else {
+          nbn_taxa2$scientific_name <- NA_character_
+        }
+      }
+      
+      # rank
+      if (!"rank" %in% names(nbn_taxa2)) {
+        nbn_taxa2$rank <- NA_character_
+      }
+      
+      nbn_exact <- nbn_taxa2 %>%
+        filter(
+          !is.na(scientific_name),
+          tolower(scientific_name) == tolower(species_name),
+          !is.na(rank),
+          tolower(rank) == "species"
+        )
+      
+      if (nrow(nbn_exact) == 0) {
+        message(
+          "[NBN] No exact species match for '", species_name, "' in NBN taxonomy.\n",
+          "      (Non-UK taxon, synonym/spelling difference, or absent from NBN.)\n",
+          "      Skipping NBN pull and writing an empty output so the pipeline can continue."
+        )
+        
+        nbn_clean <- empty_nbn_clean()
+        readr::write_csv(nbn_clean, nbn_outfile)
+        message("Saved NBN clean file (EMPTY): ", nbn_outfile)
+        return(nbn_clean)
+      }
+    } else {
+      # If we can't interpret the taxon table reliably, fall back to attempting a pull.
+      # Downstream steps will still be safe (and cached results will be used thereafter).
+      message("[NBN] Taxon table format unexpected; proceeding to attempt pull.")
+    }
   }
-  
-  # If we got here, we either:
-  #   - have no cache and have passed the strict taxon guard, OR
-  #   - had cache but it was stale and we are re-pulling.
   
   max_retries <- 5
   retry_base_wait_s <- 10
   
-  # Prefer a checkpoint, but only if it has the new QA fields
+  # Prefer a checkpoint, but only if it has the required fields for the current schema
   nbn_raw <- NULL
   if (file.exists(nbn_ckpt_file)) {
     message("Found NBN checkpoint, loading: ", nbn_ckpt_file)
@@ -1182,7 +1209,7 @@ pull_nbn_clean <- function(species_name,
     if (has_license && has_required && has_qa) {
       nbn_raw <- tmp
     } else {
-      message("Checkpoint exists but is missing QA columns; re-downloading.")
+      message("Checkpoint exists but is missing required columns; re-downloading.")
       nbn_raw <- NULL
     }
   }
@@ -1190,7 +1217,7 @@ pull_nbn_clean <- function(species_name,
   # If no usable checkpoint, download with retries
   if (is.null(nbn_raw)) {
     
-    # Field sets (avoid the known 403 fields: dateIdentified, basisOfRecord, occurrenceStatus)
+    # Field sets (avoid known 403 fields: dateIdentified, basisOfRecord, occurrenceStatus)
     nbn_core <- c(
       "recordID",
       "scientificName",
@@ -1274,7 +1301,6 @@ pull_nbn_clean <- function(species_name,
     
     if (is.null(nbn_raw)) stop("NBN pull failed after retries for: ", species_name)
     
-    # Save raw pull to checkpoint so we don't need to re-download next time
     saveRDS(nbn_raw, nbn_ckpt_file)
     message("Saved NBN checkpoint: ", nbn_ckpt_file)
   }
@@ -1282,7 +1308,7 @@ pull_nbn_clean <- function(species_name,
   message("NBN raw rows: ", nrow(nbn_raw))
   
   # -------------------------------------------------------------------------
-  # Record check + cleaning (NBN) (UPDATED: include QA/certainty fields)
+  # Record check + cleaning (NBN)
   # -------------------------------------------------------------------------
   lic_col <- if ("dcterms:license" %in% names(nbn_raw)) "dcterms:license" else "license"
   
@@ -1328,7 +1354,7 @@ pull_nbn_clean <- function(species_name,
       licence_expected = !is.na(lic_normalise_nbn(.data[[lic_col]])) &
         lic_normalise_nbn(.data[[lic_col]]) %in% expected_licences_nbn,
       
-      # QA / certainty fields (NEW)
+      # QA / certainty fields
       coordinateUncertaintyInMeters = as.numeric(coordinateUncertaintyInMeters),
       coordinatePrecision = as.character(coordinatePrecision),
       identificationVerificationStatus = as.character(identificationVerificationStatus),
@@ -1363,9 +1389,9 @@ pull_nbn_clean <- function(species_name,
   write_csv(nbn_clean, nbn_outfile)
   message("Saved NBN clean file: ", nbn_outfile)
   
-  # ---------------------------------------------------------------------------
+  # -------------------------------------------------------------------------
   # Licence flagging
-  # ---------------------------------------------------------------------------
+  # -------------------------------------------------------------------------
   if (nrow(nbn_clean) == 0) {
     message("[NBN] No records after coordinate screening; skipping licence checks.")
     message("NBN clean: 0 records.")
@@ -1479,7 +1505,7 @@ pull_raw_occurrences <- function(species_names,
   }
   
   # ---------------------------------------------------------------------------
-  # Final GBIF status warning (e.g., pending downloads)
+  # Final GBIF status warning (e.g., pending downloads, retry-exhausted search)
   # ---------------------------------------------------------------------------
   if (length(gbif_incomplete) > 0) {
     message("\n==================== GBIF WARNING ====================")
