@@ -20,6 +20,15 @@ script_dir <- dirname(normalizePath(this_file))
 repo_root  <- normalizePath(file.path(script_dir, ".."))
 setwd(repo_root)
 
+# ---- Optional: keep checkpoints on a local disk (recommended on synced/network drives) ----
+# The engine writes small checkpoint .rds files frequently (for paging + GBIF download keys).
+# On Google Drive/OneDrive/network shares, interrupted sync or file-locking can occasionally corrupt
+# a checkpoint mid-write. If you set INFLUENTIAL_CHECKPOINT_ROOT to a local folder, checkpoints are
+# written there instead, while outputs still go to data/raw/ as usual.
+#
+# Uncomment and set a real local path if you want this behaviour:
+# Sys.setenv(INFLUENTIAL_CHECKPOINT_ROOT = "C:/temp/influentialspecies_checkpoints")
+
 # ---- Load the workflow function ----
 pull_fn <- file.path(repo_root, "R", "pull_raw_occurrences.R")
 if (!file.exists(pull_fn)) {
