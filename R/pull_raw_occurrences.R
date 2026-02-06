@@ -1556,6 +1556,7 @@ pull_raw_occurrences <- function(species_names,
   names(out) <- species_names
   
   gbif_incomplete <- list()
+  nbn_incomplete  <- list()
   
   for (i in seq_along(species_names)) {
     sp <- species_names[i]
@@ -1584,16 +1585,99 @@ pull_raw_occurrences <- function(species_names,
       gbif_incomplete[[sp]] <- st
     }
     
-    nbn_clean <- pull_nbn_clean(
-      species_name = sp,
-      group_dir = group_dir,
-      nbn_email = nbn_email,
-      download_reason_id = download_reason_id,
-      expected_licences_nbn = expected_licences_nbn,
-      use_cache = use_cache,
-      pause_s = pause_s,
-      species_subdir = species_subdir
+    nbn_clean <- tryCatch(
+      pull_nbn_clean(
+        species_name = sp,
+        group_dir = group_dir,
+        nbn_email = nbn_email,
+        download_reason_id = download_reason_id,
+        expected_licences_nbn = expected_licences_nbn,
+        use_cache = use_cache,
+        pause_s = pause_s,
+        species_subdir = species_subdir
+      ),
+      error = function(e) {
+        # NBN auth tokens can expire mid-run (403 / OAuth errors), and intermittent service/network
+        # issues can happen. We write a schema-correct empty output so downstream steps don't break,
+        # record what happened for the final warning, and continue to the next species.
+        msg <- conditionMessage(e)
+        
+        reason <- if (grepl("OAuth error|authentication required|HTTP 403", msg, ignore.case = TRUE)) {
+          "authentication_required"
+        } else {
+          "error"
+        }
+        
+        message(
+          "\n[NBN][INCOMPLETE] Failed to pull NBN records for ", sp, ".\n",
+          "  Error: ", msg, "\n",
+          "Continuing to the next species.\n"
+        )
+        
+        if (identical(reason, "authentication_required")) {
+          message(
+            "[NBN] This looks like an authentication problem. In an interactive session, run:\n",
+            "  library(galah)\n",
+            "  galah_config(atlas = \"United Kingdom\", email = \"", nbn_email, "\", verbose = FALSE)\n",
+            "  galah_login()\n"
+          )
+        }
+        
+        group_dir2 <- normalise_group_dir(group_dir)
+        slug <- slugify_species(sp)
+        nbn_out_root <- if (nzchar(group_dir2)) {
+          file.path(repo_root, "data", "raw", "nbn", group_dir2)
+        } else {
+          file.path(repo_root, "data", "raw", "nbn")
+        }
+        nbn_out_dir <- if (isTRUE(species_subdir)) file.path(nbn_out_root, slug) else nbn_out_root
+        dir.create(nbn_out_dir, recursive = TRUE, showWarnings = FALSE)
+        
+        nbn_outfile <- file.path(nbn_out_dir, paste0("nbn_", slug, "_clean.csv"))
+        
+        nbn_clean_fallback <- tibble::tibble(
+          source = character(),
+          species = character(),
+          recordID = character(),
+          lon = numeric(),
+          lat = numeric(),
+          date = character(),
+          year = integer(),
+          licence_raw = character(),
+          licence = character(),
+          licence_expected = logical(),
+          coordinateUncertaintyInMeters = numeric(),
+          coordinatePrecision = character(),
+          identificationVerificationStatus = character(),
+          identifiedBy = character(),
+          # Schema alignment / provenance fields (often NA for NBN)
+          basisOfRecord = character(),
+          taxonRank = character(),
+          occurrenceStatus = character(),
+          datasetKey = character(),
+          datasetName = character(),
+          publishingOrgKey = character(),
+          institutionCode = character(),
+          collectionCode = character()
+        )
+        
+        readr::write_csv(nbn_clean_fallback, nbn_outfile)
+        message("Saved NBN clean file (EMPTY): ", nbn_outfile)
+        
+        attr(nbn_clean_fallback, "nbn_status") <- list(
+          state = "incomplete",
+          reason = reason,
+          error = msg
+        )
+        
+        nbn_clean_fallback
+      }
     )
+    
+    nst <- attr(nbn_clean, "nbn_status")
+    if (!is.null(nst) && !identical(nst$state, "complete")) {
+      nbn_incomplete[[sp]] <- nst
+    }
     
     out[[i]] <- list(gbif_clean = gbif_clean, nbn_clean = nbn_clean)
   }
@@ -1616,6 +1700,21 @@ pull_raw_occurrences <- function(species_names,
     }
     message("\nRe-run the script later to resume any pending GBIF downloads.")
     message("======================================================\n")
+  }
+  
+  # ---------------------------------------------------------------------------
+  # Final NBN status warning (e.g., authentication required, retry-exhausted)
+  # ---------------------------------------------------------------------------
+  if (length(nbn_incomplete) > 0) {
+    message("\n==================== NBN WARNING ====================")
+    message("Some NBN pulls did not complete (often authentication or temporary service issues).")
+    for (nm in names(nbn_incomplete)) {
+      s <- nbn_incomplete[[nm]]
+      line <- paste0(" - ", nm, ": ", s$reason)
+      if (!is.null(s$error) && !is.na(s$error) && nzchar(s$error)) line <- paste0(line, " | ", s$error)
+      message(line)
+    }
+    message("====================================================\n")
   }
   
   invisible(out)

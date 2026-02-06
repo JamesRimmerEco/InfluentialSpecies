@@ -21,13 +21,14 @@ repo_root  <- normalizePath(file.path(script_dir, ".."))
 setwd(repo_root)
 
 # ---- Optional: keep checkpoints on a local disk (recommended on synced/network drives) ----
-# The engine writes small checkpoint .rds files frequently (for paging + GBIF download keys).
-# On Google Drive/OneDrive/network shares, interrupted sync or file-locking can occasionally corrupt
-# a checkpoint mid-write. If you set INFLUENTIAL_CHECKPOINT_ROOT to a local folder, checkpoints are
-# written there instead, while outputs still go to data/raw/ as usual.
+# The engine writes small checkpoint .rds files frequently. On some synced/network drives this can be slow or occasionally flaky. Setting this environment variable tells the engine to store checkpoints locally while still writing the final CSV outputs into the repo.
 #
-# Uncomment and set a real local path if you want this behaviour:
-# Sys.setenv(INFLUENTIAL_CHECKPOINT_ROOT = "C:/temp/influentialspecies_checkpoints")
+# Choose a folder that exists and is writeable on your machine (this example uses a per-user folder).
+local_ckpt_dir <- file.path(Sys.getenv("LOCALAPPDATA"), "InfluentialSpecies_checkpoints")
+if (nzchar(Sys.getenv("LOCALAPPDATA"))) {
+  dir.create(local_ckpt_dir, recursive = TRUE, showWarnings = FALSE)
+  Sys.setenv(INFLUENTIALSPECIES_CHECKPOINT_DIR = local_ckpt_dir)
+}
 
 # ---- Load the workflow function ----
 pull_fn <- file.path(repo_root, "R", "pull_raw_occurrences.R")
@@ -48,6 +49,35 @@ use_cache <- TRUE
 # Write straight into data/raw/gbif and data/raw/nbn
 # (Optional: set group_dir <- "mapping_list_100sp" to keep outputs in a subfolder.)
 group_dir <- ""
+
+# ---- Optional: attempt to ensure NBN authentication is available for this session ----
+# galah uses an OAuth token stored on disk. On shared / restarted machines it can expire or be missing.
+# This tries to log in once at the start so the long batch run is less likely to fail mid-way.
+# If login is not possible (e.g., running headless), the engine will still handle failures and continue.
+suppressPackageStartupMessages({
+  library(galah)
+})
+
+try({
+  galah_config(atlas = "United Kingdom", email = nbn_email, verbose = FALSE)
+  # If an interactive login is needed, this may open a browser prompt.
+  # If it cannot run (no browser, policy restriction), it will error and we continue anyway.
+  galah_login()
+}, silent = TRUE)
+
+# ---- Optional: remind yourself early if GBIF credentials are missing ----
+# GBIF downloads require credentials in the environment (GBIF_USER / GBIF_PWD / GBIF_EMAIL).
+# The engine can still run for <=100k species without these, but download species will remain pending.
+gbif_user  <- Sys.getenv("GBIF_USER")
+gbif_pwd   <- Sys.getenv("GBIF_PWD")
+gbif_email <- Sys.getenv("GBIF_EMAIL")
+if (!(nzchar(gbif_user) && nzchar(gbif_pwd) && nzchar(gbif_email))) {
+  message(
+    "\n[NOTE] GBIF credentials are not set in this session.\n",
+    "      Species that require GBIF downloads (>100k expected) will be skipped until\n",
+    "      GBIF_USER / GBIF_PWD / GBIF_EMAIL are available.\n"
+  )
+}
 
 # Species list (Latin names only; common names in comments for readability)
 species_names <- c(
