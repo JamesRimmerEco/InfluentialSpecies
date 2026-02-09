@@ -1,11 +1,9 @@
-# InfluentialSpecies/scripts/pull_raw_species_set_mapping_list_100sp_HOME_SAFE_RESUME.R
+# InfluentialSpecies/scripts/pull_raw_species_set_mapping_list_100sp_HOME_SAFE_v1.R
 #
 # Single stable home-run wrapper (resume in one fixed folder).
 # - Always uses the same group_dir (home_run_2026-02-06 unless you change it)
-# - Skips any species that already has BOTH GBIF + NBN outputs in that folder
+# - Engine decides whether each species is already complete (GBIF checkpoint + NBN state)
 # - Never stops on a single-species error
-# - Avoids repeatedly hammering GBIF downloads when the "3 simultaneous downloads" limit is hit:
-#     species that trigger that error are deferred until a later pass
 # - Multi-pass loop so it can run unattended for days
 
 # ---- Find repo root (works when sourced from a file) ----
@@ -18,6 +16,7 @@ repo_root  <- normalizePath(file.path(script_dir, ".."))
 setwd(repo_root)
 
 # ---- Local checkpoints (engine reads INFLUENTIAL_CHECKPOINT_ROOT) ----
+# Checkpoints are small and fast locally; the engine now cleans up big GBIF zips automatically.
 local_ckpt_root <- file.path(Sys.getenv("LOCALAPPDATA"), "InfluentialSpecies_checkpoints")
 if (nzchar(Sys.getenv("LOCALAPPDATA"))) {
   dir.create(local_ckpt_root, recursive = TRUE, showWarnings = FALSE)
@@ -25,6 +24,14 @@ if (nzchar(Sys.getenv("LOCALAPPDATA"))) {
   message("[OK] Checkpoints: ", local_ckpt_root)
 } else {
   message("[NOTE] LOCALAPPDATA not set; engine may store checkpoints under data/_checkpoints.")
+}
+
+# ---- Optional: GBIF work folder (zips + extraction) ----
+# By default this falls back to INFLUENTIAL_CHECKPOINT_ROOT. You can point it at another drive if you have one.
+# Example:
+#   Sys.setenv(INFLUENTIAL_GBIF_WORK_ROOT = "D:/InfluentialSpecies_work")
+if (!nzchar(Sys.getenv("INFLUENTIAL_GBIF_WORK_ROOT"))) {
+  Sys.setenv(INFLUENTIAL_GBIF_WORK_ROOT = Sys.getenv("INFLUENTIAL_CHECKPOINT_ROOT"))
 }
 
 # ---- Load engine ----
@@ -45,10 +52,8 @@ use_cache <- TRUE
 group_dir <- "home_run_2026-02-06"
 
 # Long-run behaviour
-max_hours_total          <- 72          # set Inf if you want endless
-sleep_minutes_between    <- 15
-max_active_gbif_download <- 2           # keep below GBIF hard limit (3)
-skip_species_if_outputs_exist <- TRUE
+max_hours_total       <- 72          # set Inf if you want endless
+sleep_minutes_between <- 15
 
 # NBN auth (best effort)
 try({
@@ -91,21 +96,6 @@ write_heartbeat <- function(state) {
   )
 }
 
-slugify <- function(x) {
-  s <- tolower(trimws(x))
-  s <- gsub("[^a-z0-9]+", "_", s)
-  s <- gsub("^_+|_+$", "", s)
-  s
-}
-
-gbif_outfile <- function(sp) {
-  file.path(repo_root, "data", "raw", "gbif", group_dir, paste0("gbif_", slugify(sp), "_clean.csv"))
-}
-
-nbn_outfile <- function(sp) {
-  file.path(repo_root, "data", "raw", "nbn", group_dir, paste0("nbn_", slugify(sp), "_clean.csv"))
-}
-
 # ---- Species list ----
 species_names <- c(
   "Ursus arctos","Sus scrofa","Bos taurus","Canis lupus","Cervus elaphus","Equus ferus","Meles meles","Oryctolagus cuniculus",
@@ -124,64 +114,6 @@ species_names <- c(
   "Accipiter nisus","Falco tinnunculus","Strix aluco","Asio otus","Circus cyaneus","Ciconia nigra","Ciconia ciconia","Nycticorax nycticorax",
   "Pelecanus crispus"
 )
-
-# ---- Deferred download list (persists across passes/runs) ----
-defer_file <- file.path(log_dir, paste0("gbif_deferred_downloads_", group_dir, ".rds"))
-deferred_downloads <- if (file.exists(defer_file)) readRDS(defer_file) else character()
-
-save_deferred <- function() {
-  deferred_downloads <<- unique(deferred_downloads)
-  saveRDS(deferred_downloads, defer_file)
-}
-
-# ---- GBIF active download count (best effort) ----
-list_local_gbif_download_keys <- function() {
-  ckpt_root <- Sys.getenv("INFLUENTIAL_CHECKPOINT_ROOT")
-  if (!nzchar(ckpt_root)) ckpt_root <- file.path(repo_root, "data", "_checkpoints")
-  gbif_ckpt_dir <- file.path(ckpt_root, "gbif")
-  if (!dir.exists(gbif_ckpt_dir)) return(character())
-  files <- list.files(gbif_ckpt_dir, pattern = "^gbif_pull_checkpoint_.*\\.rds$", full.names = TRUE)
-  
-  keys <- character()
-  for (f in files) {
-    x <- tryCatch(readRDS(f), error = function(e) NULL)
-    if (is.null(x)) next
-    k <- x$download_key
-    if (!is.null(k) && !is.na(k) && nzchar(k)) keys <- c(keys, as.character(k))
-  }
-  unique(keys)
-}
-
-count_active_gbif_downloads <- function(keys) {
-  if (length(keys) == 0) return(0L)
-  inactive <- c("SUCCEEDED", "CANCELLED", "KILLED", "FAILED")
-  active <- 0L
-  for (k in keys) {
-    st <- tryCatch(rgbif::occ_download_meta(k)$status, error = function(e) NA_character_)
-    if (is.na(st) || !(st %in% inactive)) active <- active + 1L
-  }
-  active
-}
-
-run_one_species_safe <- function(sp, gbif_method) {
-  tryCatch(
-    {
-      pull_raw_occurrences(
-        species_names      = c(sp),
-        group_dir          = group_dir,
-        nbn_email          = nbn_email,
-        use_cache          = use_cache,
-        species_subdir     = FALSE,
-        gbif_method        = gbif_method,
-        gbif_download_wait = FALSE
-      )
-      list(ok = TRUE, error = NULL)
-    },
-    error = function(e) {
-      list(ok = FALSE, error = conditionMessage(e))
-    }
-  )
-}
 
 log_line("[RUN] group_dir='", group_dir, "'")
 log_line("[RUN] Log: ", log_file)
@@ -204,62 +136,29 @@ repeat {
   log_line("[PASS ", pass, "] starting (elapsed ", sprintf("%.2f", elapsed_h), "h)")
   log_line("============================================================")
   
-  gbif_keys <- list_local_gbif_download_keys()
-  n_active  <- if (have_gbif_creds) count_active_gbif_downloads(gbif_keys) else 0L
-  
-  allow_submit_now <- have_gbif_creds && (n_active < max_active_gbif_download)
-  gbif_method_this_pass <- if (allow_submit_now) "auto" else "search"
-  
-  log_line("[PASS ", pass, "] GBIF keys=", length(gbif_keys),
-           " | active~=", n_active,
-           " | allow_submit_now=", allow_submit_now,
-           " | gbif_method=", gbif_method_this_pass)
-  
-  n_ok <- 0L
-  n_skip <- 0L
-  n_err <- 0L
-  
-  for (sp in species_names) {
-    write_heartbeat(paste0("pass_", pass, "_running_", gsub("\\s+", "_", sp)))
-    
-    # Skip if outputs already exist in the stable folder
-    if (skip_species_if_outputs_exist) {
-      if (file.exists(gbif_outfile(sp)) && file.exists(nbn_outfile(sp))) {
-        n_skip <- n_skip + 1L
-        next
-      }
+  res <- tryCatch(
+    {
+      pull_raw_occurrences(
+        species_names = species_names,
+        group_dir = group_dir,
+        species_subdir = FALSE,
+        nbn_email = nbn_email,
+        use_cache = use_cache,
+        gbif_method = "auto",
+        gbif_download_wait = FALSE,
+        skip_species_if_complete = TRUE,
+        cleanup_gbif_work_files = TRUE
+      )
+      list(ok = TRUE, error = NULL)
+    },
+    error = function(e) {
+      list(ok = FALSE, error = conditionMessage(e))
     }
-    
-    # If downloads are currently throttled, don't waste time repeatedly triggering the same GBIF limit error
-    if (!allow_submit_now && (sp %in% deferred_downloads)) {
-      n_skip <- n_skip + 1L
-      next
-    }
-    
-    log_line("[SPECIES] ", sp, " | gbif_method=", gbif_method_this_pass)
-    
-    res <- run_one_species_safe(sp, gbif_method = gbif_method_this_pass)
-    
-    if (isTRUE(res$ok)) {
-      n_ok <- n_ok + 1L
-      # If it previously hit the download limit, allow it again in future
-      if (sp %in% deferred_downloads) {
-        deferred_downloads <- setdiff(deferred_downloads, sp)
-        save_deferred()
-      }
-    } else {
-      n_err <- n_err + 1L
-      log_line("[ERROR] ", sp, " | ", res$error)
-      
-      # Detect GBIF simultaneous download limit and defer this species until later
-      if (grepl("too many simultaneous downloads", res$error, ignore.case = TRUE)) {
-        deferred_downloads <- unique(c(deferred_downloads, sp))
-        save_deferred()
-      }
-    }
+  )
+  
+  if (!isTRUE(res$ok)) {
+    log_line("[ERROR] Pass-level error: ", res$error)
   }
-  
-  log_line("[PASS ", pass, "] finished. ok=", n_ok, " skip=", n_skip, " error=", n_err)
   
   write_heartbeat(paste0("pass_", pass, "_sleeping"))
   log_line("[SLEEP] ", sleep_minutes_between, " minutes...")

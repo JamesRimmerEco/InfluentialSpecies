@@ -26,13 +26,21 @@
 #
 # Checkpoints
 #   Checkpoints are stored to support resuming long or asynchronous pulls:
-#     data/_checkpoints/gbif/gbif_pull_checkpoint_<slug>.rds
-#     data/_checkpoints/nbn/nbn_pull_checkpoint_<slug>.rds
+#     <checkpoint_root>/gbif/gbif_pull_checkpoint_<slug>.rds
+#     <checkpoint_root>/nbn/nbn_state_<slug>.rds
 #
 #   Optional (recommended on synced/network drives):
 #     If you set Sys.setenv(INFLUENTIAL_CHECKPOINT_ROOT = "<local folder>"),
 #     checkpoints will be written under that folder instead of inside the repo.
 #     This reduces the chance of checkpoint corruption if the repo lives on Google Drive/OneDrive.
+#
+# GBIF work files (disk safety)
+#   GBIF downloads can be huge (multi-GB zips + much larger extracted files). By default we:
+#     - download zips into INFLUENTIAL_GBIF_WORK_ROOT/gbif_zips
+#     - extract into INFLUENTIAL_GBIF_WORK_ROOT/gbif_unzip
+#     - delete both the zip and extracted folder once the clean CSV is written successfully
+#
+#   If INFLUENTIAL_GBIF_WORK_ROOT is not set, we fall back to the checkpoint root.
 #
 # How GBIF pulls work (important)
 #   - GBIF "search" (occ_search) is hard-limited to 100,000 records per query.
@@ -51,41 +59,12 @@
 #   - Once a species is complete (CSV exists AND checkpoint is marked complete),
 #     re-running does NOT re-download or re-pull that species; it is treated as cached.
 #
-#   Reliability improvement (applies to any species, including those <100k):
-#   - If occ_search paging repeatedly fails at a particular offset (after retries),
-#     the script will (i) retry that page with a smaller page size and, if it still fails,
-#     (ii) switch to a GBIF download job for that species so the pipeline can continue.
-#
-# Typical usage
-#   - You usually run this via a wrapper script in /scripts/ (e.g. pull_raw_species_set_*.R).
-#   - If no species exceed 100k, one run is enough.
-#   - If any species exceed 100k (or if search paging falls back to downloads),
-#     you may need to re-run the wrapper script one or more times until the final
-#     "GBIF WARNING" list disappears (all downloads completed).
-#
-# QA / certainty fields included in the "raw clean" outputs
-#   GBIF:
-#     - coordinateUncertaintyInMeters
-#     - identificationVerificationStatus
-#     - issues
-#     - identifiedBy
-#     - dateIdentified
-#   NBN:
-#     - coordinateUncertaintyInMeters
-#     - identificationVerificationStatus
-#     - identifiedBy
-#     - coordinatePrecision (often NA, but included if selectable)
-#
 # Licence handling
 #   We do not filter by licence at this stage.
 #   However, we still define "expected" licence sets for each source and, if any other
 #   licence types appear, we:
 #     (i) flag this clearly to the console, and
 #     (ii) write a per-species log file under data/raw/licence_flags/
-#
-# Notes
-#   - If cached *_clean.csv files were created before key fields were added (e.g. QA/provenance),
-#     this script treats them as stale and will re-pull.
 # ------------------------------------------------------------------------------
 
 suppressPackageStartupMessages({
@@ -204,6 +183,23 @@ get_checkpoint_root <- function(repo_root) {
   file.path(repo_root, "data", "_checkpoints")
 }
 
+# ---- Helper: GBIF work folders (zips + extraction) ---------------------------
+get_gbif_work_root <- function(repo_root) {
+  # This is where big GBIF artefacts live briefly (zip + extraction), and are cleaned after success.
+  root <- Sys.getenv("INFLUENTIAL_GBIF_WORK_ROOT")
+  if (nzchar(root)) return(normalizePath(root, winslash = "/", mustWork = FALSE))
+  get_checkpoint_root(repo_root)
+}
+
+gbif_work_dirs <- function(repo_root) {
+  root <- get_gbif_work_root(repo_root)
+  zip_dir <- file.path(root, "gbif_zips")
+  unzip_root <- file.path(root, "gbif_unzip")
+  dir.create(zip_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(unzip_root, recursive = TRUE, showWarnings = FALSE)
+  list(root = root, zip_dir = zip_dir, unzip_root = unzip_root)
+}
+
 # ---- Helper: write unexpected licence log (only if needed) -------------------
 write_unexpected_licence_log <- function(species_name, slug, source_name, unexpected_tbl, repo_root) {
   if (nrow(unexpected_tbl) == 0) return(invisible(NULL))
@@ -223,6 +219,54 @@ write_unexpected_licence_log <- function(species_name, slug, source_name, unexpe
   invisible(log_file)
 }
 
+# ---- Helper: robust read of GBIF download occurrence file --------------------
+read_gbif_download_occurrence <- function(occ_file, needed_cols) {
+  
+  # GBIF downloads are Darwin Core; occurrence.txt is normally tab-separated with many columns.
+  # Reading the full file into memory is expensive; we pull only the columns we actually use.
+  delim <- if (grepl("\\.csv$", occ_file, ignore.case = TRUE)) "," else "\t"
+  
+  hdr <- readLines(occ_file, n = 1, warn = FALSE, encoding = "UTF-8")
+  if (length(hdr) == 0) stop("GBIF occurrence file appears to be empty: ", occ_file)
+  
+  hdr_cols <- strsplit(hdr, split = delim, fixed = TRUE)[[1]]
+  idx <- match(needed_cols, hdr_cols)
+  keep <- which(!is.na(idx))
+  if (length(keep) == 0) stop("Could not find any expected columns in GBIF download: ", occ_file)
+  
+  # Prefer data.table::fread if available (it is much more robust for very large tab files).
+  if (requireNamespace("data.table", quietly = TRUE)) {
+    dt <- data.table::fread(
+      occ_file,
+      sep = delim,
+      select = idx[keep],
+      showProgress = TRUE,
+      quote = "",
+      encoding = "UTF-8"
+    )
+    df <- as.data.frame(dt)
+  } else {
+    # Fallback to readr (works, but more fragile for very large files)
+    df <- readr::read_delim(
+      occ_file,
+      delim = delim,
+      show_col_types = FALSE,
+      progress = TRUE,
+      col_select = dplyr::all_of(hdr_cols[idx[keep]]),
+      name_repair = "minimal"
+    )
+    df <- as.data.frame(df)
+  }
+  
+  # Standardise types we care about
+  if ("decimalLongitude" %in% names(df)) df$decimalLongitude <- as.numeric(df$decimalLongitude)
+  if ("decimalLatitude"  %in% names(df)) df$decimalLatitude  <- as.numeric(df$decimalLatitude)
+  if ("year" %in% names(df)) df$year <- suppressWarnings(as.integer(df$year))
+  if ("coordinateUncertaintyInMeters" %in% names(df)) df$coordinateUncertaintyInMeters <- as.numeric(df$coordinateUncertaintyInMeters)
+  
+  df
+}
+
 # ==============================================================================
 # GBIF pull (Europe-wide) ------------------------------------------------------
 # ==============================================================================
@@ -240,6 +284,7 @@ pull_gbif_clean <- function(species_name,
                             gbif_download_wait = FALSE,
                             gbif_search_hard_limit = 100000L,
                             gbif_download_on_search_error = TRUE,
+                            cleanup_gbif_work_files = TRUE,
                             gbif_user = Sys.getenv("GBIF_USER"),
                             gbif_pwd = Sys.getenv("GBIF_PWD"),
                             gbif_email = Sys.getenv("GBIF_EMAIL")) {
@@ -484,14 +529,24 @@ pull_gbif_clean <- function(species_name,
     # If no key yet, submit a download and return (so the run can continue to other species)
     if (is.null(ckpt$download_key) || is.na(ckpt$download_key) || !nzchar(ckpt$download_key)) {
       
-      dl <- rgbif::occ_download(
-        rgbif::pred_and(
-          rgbif::pred("taxonKey", taxon_key),
-          rgbif::pred("continent", region_scope),
-          rgbif::pred("hasCoordinate", TRUE)
+      dl <- tryCatch(
+        rgbif::occ_download(
+          rgbif::pred_and(
+            rgbif::pred("taxonKey", taxon_key),
+            rgbif::pred("continent", region_scope),
+            rgbif::pred("hasCoordinate", TRUE)
+          ),
+          user = gbif_user, pwd = gbif_pwd, email = gbif_email
         ),
-        user = gbif_user, pwd = gbif_pwd, email = gbif_email
+        error = function(e) e
       )
+      
+      if (inherits(dl, "error")) {
+        msg <- conditionMessage(dl)
+        gbif_clean <- empty_gbif_clean()
+        attr(gbif_clean, "gbif_status") <- list(state = "download_submit_failed", method = "download", expected = total_expected, error = msg)
+        stop(msg)
+      }
       
       dl_key <- if (is.list(dl) && "key" %in% names(dl)) dl$key else as.character(dl)
       
@@ -538,15 +593,26 @@ pull_gbif_clean <- function(species_name,
       return(gbif_clean)
     }
     
-    zip_path <- rgbif::occ_download_get(key, path = gbif_ckpt_dir, overwrite = TRUE)
+    # Work dirs for zip + extraction (cleaned after success)
+    wd <- gbif_work_dirs(repo_root)
+    
+    zip_path <- rgbif::occ_download_get(key, path = wd$zip_dir, overwrite = TRUE)
     if (is.list(zip_path) && "path" %in% names(zip_path)) zip_path <- zip_path$path
     
-    tmpdir <- tempfile("gbif_dwc_")
-    dir.create(tmpdir)
-    utils::unzip(zip_path, exdir = tmpdir)
+    unzip_dir <- file.path(wd$unzip_root, paste0("gbif_dwc_", key))
+    dir.create(unzip_dir, recursive = TRUE, showWarnings = FALSE)
+    
+    # Always clear extraction folders; zip is removed only after a clean success.
+    on.exit({
+      if (isTRUE(cleanup_gbif_work_files)) {
+        unlink(unzip_dir, recursive = TRUE, force = TRUE)
+      }
+    }, add = TRUE)
+    
+    utils::unzip(zip_path, exdir = unzip_dir)
     
     occ_file <- list.files(
-      tmpdir,
+      unzip_dir,
       pattern = "occurrence\\.(txt|csv)$",
       recursive = TRUE,
       full.names = TRUE,
@@ -579,49 +645,7 @@ pull_gbif_clean <- function(species_name,
       "collectionCode"
     )
     
-    ct <- readr::cols(
-      gbifID = readr::col_character(),
-      occurrenceID = readr::col_character(),
-      decimalLongitude = readr::col_double(),
-      decimalLatitude  = readr::col_double(),
-      eventDate = readr::col_character(),
-      year = readr::col_integer(),
-      countryCode = readr::col_character(),
-      license = readr::col_character(),
-      coordinateUncertaintyInMeters = readr::col_double(),
-      identificationVerificationStatus = readr::col_character(),
-      issues = readr::col_character(),
-      issue  = readr::col_character(),
-      identifiedBy = readr::col_character(),
-      dateIdentified = readr::col_character(),
-      basisOfRecord = readr::col_character(),
-      taxonRank = readr::col_character(),
-      occurrenceStatus = readr::col_character(),
-      datasetKey = readr::col_character(),
-      datasetName = readr::col_character(),
-      publishingOrgKey = readr::col_character(),
-      institutionCode = readr::col_character(),
-      collectionCode = readr::col_character(),
-      .default = readr::col_character()
-    )
-    
-    if (grepl("\\.csv$", occ_file, ignore.case = TRUE)) {
-      gbif_raw <- readr::read_csv(
-        occ_file,
-        show_col_types = FALSE,
-        progress = TRUE,
-        col_select = dplyr::any_of(needed_cols),
-        col_types = ct
-      )
-    } else {
-      gbif_raw <- readr::read_tsv(
-        occ_file,
-        show_col_types = FALSE,
-        progress = TRUE,
-        col_select = dplyr::any_of(needed_cols),
-        col_types = ct
-      )
-    }
+    gbif_raw <- read_gbif_download_occurrence(occ_file, needed_cols)
     
     message("GBIF rows read from download file: ", nrow(gbif_raw))
     
@@ -647,8 +671,8 @@ pull_gbif_clean <- function(species_name,
         species = species_name,
         gbifID = as.character(gbifID),
         occurrenceID = as.character(occurrenceID),
-        lon = decimalLongitude,
-        lat = decimalLatitude,
+        lon = as.numeric(decimalLongitude),
+        lat = as.numeric(decimalLatitude),
         date = as.character(eventDate),
         year = as.integer(year),
         country = as.character(countryCode),
@@ -692,6 +716,11 @@ pull_gbif_clean <- function(species_name,
     safe_saveRDS(ckpt, ckpt_file)
     
     attr(gbif_clean, "gbif_status") <- list(state = "complete", method = "download", key = key, expected = total_expected)
+    
+    # Clean up big GBIF artefacts as soon as we have the clean CSV on disk.
+    if (isTRUE(cleanup_gbif_work_files)) {
+      unlink(zip_path, force = TRUE)
+    }
     
     if (nrow(gbif_clean) > 0) {
       unexpected_tbl <- gbif_clean %>%
@@ -1096,8 +1125,7 @@ pull_nbn_clean <- function(species_name,
                            download_reason_id = 17,
                            expected_licences_nbn = c("OGL", "CC0", "CC-BY", "CC-BY-NC"),
                            use_cache = TRUE,
-                           pause_s = 0.25)
-{
+                           pause_s = 0.25) {
   
   repo_root <- get_repo_root()
   group_dir <- normalise_group_dir(group_dir)
@@ -1120,8 +1148,15 @@ pull_nbn_clean <- function(species_name,
   nbn_out_dir <- if (isTRUE(species_subdir)) file.path(nbn_out_root, slug) else nbn_out_root
   dir.create(nbn_out_dir, recursive = TRUE, showWarnings = FALSE)
   
-  nbn_outfile   <- file.path(nbn_out_dir,  paste0("nbn_", slug, "_clean.csv"))
-  nbn_ckpt_file <- file.path(nbn_ckpt_dir, paste0("nbn_pull_checkpoint_", slug, ".rds"))
+  nbn_outfile <- file.path(nbn_out_dir,  paste0("nbn_", slug, "_clean.csv"))
+  
+  # NBN completion state (small, avoids the "empty CSV looks done forever" problem)
+  nbn_state_file <- file.path(nbn_ckpt_dir, paste0("nbn_state_", slug, ".rds"))
+  nbn_state <- list(complete = FALSE, last_updated = NA_character_, note = NA_character_, last_error = NA_character_)
+  if (file.exists(nbn_state_file)) {
+    tmp <- tryCatch(readRDS(nbn_state_file), error = function(e) NULL)
+    if (!is.null(tmp) && is.list(tmp)) nbn_state <- utils::modifyList(nbn_state, tmp)
+  }
   
   # Configure galah to use the UK atlas + provide a download reason
   galah_config(atlas = "United Kingdom", email = nbn_email, verbose = FALSE)
@@ -1190,6 +1225,8 @@ pull_nbn_clean <- function(species_name,
   
   # ---------------------------------------------------------------------------
   # NBN occurrence pull (cached if available + schema matches)
+  #   - For non-empty cached files: trust the cache.
+  #   - For empty cached files: trust the cache only if nbn_state says complete=TRUE.
   # ---------------------------------------------------------------------------
   use_cached <- isTRUE(use_cache) && file.exists(nbn_outfile)
   
@@ -1204,7 +1241,7 @@ pull_nbn_clean <- function(species_name,
         "\nRe-pulling from NBN: ", nbn_outfile
       )
       use_cached <- FALSE
-    } else {
+    } else if (nrow(nbn_cached) > 0) {
       message("Found existing NBN clean file, reading: ", nbn_outfile)
       
       nbn_clean <- nbn_cached %>%
@@ -1225,10 +1262,17 @@ pull_nbn_clean <- function(species_name,
           collectionCode = as.character(collectionCode)
         )
       
-      if (nrow(nbn_clean) == 0) {
-        message("[NBN] Cached file is empty; skipping licence checks.")
-        message("NBN clean: 0 records.")
+      return(nbn_clean)
+      
+    } else {
+      # Empty cached file: only treat as final if we previously recorded this as a complete pull.
+      if (isTRUE(nbn_state$complete)) {
+        message("Found existing NBN clean file (EMPTY) and NBN state is complete; keeping: ", nbn_outfile)
+        nbn_clean <- empty_nbn_clean()
         return(nbn_clean)
+      } else {
+        message("Found existing NBN clean file (EMPTY) but NBN state is not complete; retrying NBN pull: ", nbn_outfile)
+        use_cached <- FALSE
       }
     }
   }
@@ -1236,180 +1280,159 @@ pull_nbn_clean <- function(species_name,
   # ---------------------------------------------------------------------------
   # NBN taxon guard
   #   We proceed only if NBN taxonomy contains an exact, species-rank match.
-  #   This reduces the chance of pulling near-matches or surprising synonyms.
-  #   If there is no exact match, we write an empty (schema-correct) CSV and continue.
   # ---------------------------------------------------------------------------
-  if (!use_cached) {
+  nbn_taxa <- search_taxa(species_name)
+  message("NBN taxon search (top hit):")
+  
+  if (inherits(nbn_taxa, "data.frame")) {
+    nbn_taxa %>%
+      dplyr::select(dplyr::any_of(c("scientific_name", "scientificName",
+                                    "taxon_concept_id", "taxonConceptId",
+                                    "rank"))) %>%
+      head(1) %>%
+      print(n = 1)
+  } else {
+    print(utils::head(nbn_taxa, 1))
+  }
+  
+  nbn_taxa2 <- nbn_taxa
+  
+  if (inherits(nbn_taxa2, "data.frame")) {
     
-    nbn_taxa <- search_taxa(species_name)
-    message("NBN taxon search (top hit):")
-    
-    if (inherits(nbn_taxa, "data.frame")) {
-      nbn_taxa %>%
-        dplyr::select(dplyr::any_of(c("scientific_name", "scientificName",
-                                      "taxon_concept_id", "taxonConceptId",
-                                      "rank"))) %>%
-        head(1) %>%
-        print(n = 1)
-    } else {
-      print(utils::head(nbn_taxa, 1))
+    if (!"scientific_name" %in% names(nbn_taxa2)) {
+      if ("scientificName" %in% names(nbn_taxa2)) {
+        nbn_taxa2$scientific_name <- nbn_taxa2$scientificName
+      } else {
+        nbn_taxa2$scientific_name <- NA_character_
+      }
     }
     
-    nbn_taxa2 <- nbn_taxa
-    
-    if (inherits(nbn_taxa2, "data.frame")) {
-      
-      if (!"scientific_name" %in% names(nbn_taxa2)) {
-        if ("scientificName" %in% names(nbn_taxa2)) {
-          nbn_taxa2$scientific_name <- nbn_taxa2$scientificName
-        } else {
-          nbn_taxa2$scientific_name <- NA_character_
-        }
-      }
-      
-      if (!"rank" %in% names(nbn_taxa2)) {
-        nbn_taxa2$rank <- NA_character_
-      }
-      
-      nbn_exact <- nbn_taxa2 %>%
-        filter(
-          !is.na(scientific_name),
-          tolower(scientific_name) == tolower(species_name),
-          !is.na(rank),
-          tolower(rank) == "species"
-        )
-      
-      if (nrow(nbn_exact) == 0) {
-        message(
-          "[NBN] No exact species match for '", species_name, "' in NBN taxonomy.\n",
-          "      (Non-UK taxon, synonym/spelling difference, or absent from NBN.)\n",
-          "      Skipping NBN pull and writing an empty output so the pipeline can continue."
-        )
-        
-        nbn_clean <- empty_nbn_clean()
-        readr::write_csv(nbn_clean, nbn_outfile)
-        message("Saved NBN clean file (EMPTY): ", nbn_outfile)
-        return(nbn_clean)
-      }
-    } else {
-      message("[NBN] Taxon table format unexpected; proceeding to attempt pull.")
+    if (!"rank" %in% names(nbn_taxa2)) {
+      nbn_taxa2$rank <- NA_character_
     }
+    
+    nbn_exact <- nbn_taxa2 %>%
+      filter(
+        !is.na(scientific_name),
+        tolower(scientific_name) == tolower(species_name),
+        !is.na(rank),
+        tolower(rank) == "species"
+      )
+    
+    if (nrow(nbn_exact) == 0) {
+      message(
+        "[NBN] No exact species match for '", species_name, "' in NBN taxonomy.\n",
+        "      (Non-UK taxon, synonym/spelling difference, or absent from NBN.)\n",
+        "      Skipping NBN pull and writing an empty output so the pipeline can continue."
+      )
+      
+      nbn_clean <- empty_nbn_clean()
+      readr::write_csv(nbn_clean, nbn_outfile)
+      message("Saved NBN clean file (EMPTY): ", nbn_outfile)
+      
+      nbn_state$complete <- TRUE
+      nbn_state$last_updated <- as.character(Sys.time())
+      nbn_state$note <- "no_exact_species_match"
+      nbn_state$last_error <- NA_character_
+      safe_saveRDS(nbn_state, nbn_state_file)
+      
+      return(nbn_clean)
+    }
+  } else {
+    message("[NBN] Taxon table format unexpected; proceeding to attempt pull.")
   }
   
   max_retries <- 5
   retry_base_wait_s <- 10
   
-  # Prefer a checkpoint, but only if it has the required fields for the current schema
   nbn_raw <- NULL
-  if (file.exists(nbn_ckpt_file)) {
-    message("Found NBN checkpoint, loading: ", nbn_ckpt_file)
-    tmp <- tryCatch(readRDS(nbn_ckpt_file), error = function(e) {
-      message("[NBN] Checkpoint exists but could not be read (will re-download): ", nbn_ckpt_file)
-      message("      Read error: ", conditionMessage(e))
-      NULL
-    })
-    
-    if (!is.null(tmp)) {
-      has_license <- ("dcterms:license" %in% names(tmp)) || ("license" %in% names(tmp))
-      has_required <- all(c("recordID", "scientificName", "eventDate", "year",
-                            "decimalLatitude", "decimalLongitude") %in% names(tmp))
-      has_qa <- all(required_cache_cols %in% names(tmp))
-      
-      if (has_license && has_required && has_qa) {
-        nbn_raw <- tmp
-      } else {
-        message("Checkpoint exists but is missing required columns; re-downloading.")
-        nbn_raw <- NULL
-      }
-    }
-  }
   
-  # If no usable checkpoint, download with retries
-  if (is.null(nbn_raw)) {
+  # Field sets (avoid known 403 fields: dateIdentified, basisOfRecord, occurrenceStatus)
+  nbn_core <- c(
+    "recordID",
+    "scientificName",
+    "eventDate",
+    "year",
+    "decimalLatitude",
+    "decimalLongitude",
+    "license"
+  )
+  
+  nbn_qa <- c(
+    "coordinateUncertaintyInMeters",
+    "coordinatePrecision",
+    "identificationVerificationStatus",
+    "identifiedBy"
+  )
+  
+  make_select <- function(x) do.call(galah::galah_select, as.list(x))
+  
+  for (attempt in seq_len(max_retries)) {
     
-    # Field sets (avoid known 403 fields: dateIdentified, basisOfRecord, occurrenceStatus)
-    nbn_core <- c(
-      "recordID",
-      "scientificName",
-      "eventDate",
-      "year",
-      "decimalLatitude",
-      "decimalLongitude",
-      "license"
+    Sys.sleep(pause_s)
+    
+    nbn_raw_try <- tryCatch(
+      galah_call() |>
+        galah_identify(species_name) |>
+        atlas_occurrences(select = make_select(c(nbn_core, nbn_qa))),
+      error = function(e) e
     )
     
-    nbn_qa <- c(
-      "coordinateUncertaintyInMeters",
-      "coordinatePrecision",
-      "identificationVerificationStatus",
-      "identifiedBy"
+    if (!inherits(nbn_raw_try, "error")) {
+      nbn_raw <- nbn_raw_try
+      break
+    }
+    
+    message(
+      "NBN combined (core+QA) pull failed (attempt ", attempt, "/", max_retries, "): ",
+      conditionMessage(nbn_raw_try),
+      "\nTrying fallback: core-only + QA-only join..."
     )
     
-    make_select <- function(x) do.call(galah::galah_select, as.list(x))
+    core_try <- tryCatch(
+      galah_call() |>
+        galah_identify(species_name) |>
+        atlas_occurrences(select = make_select(nbn_core)),
+      error = function(e) e
+    )
     
-    for (attempt in seq_len(max_retries)) {
+    if (!inherits(core_try, "error")) {
       
-      Sys.sleep(pause_s)
-      
-      nbn_raw_try <- tryCatch(
+      qa_try <- tryCatch(
         galah_call() |>
           galah_identify(species_name) |>
-          atlas_occurrences(select = make_select(c(nbn_core, nbn_qa))),
+          atlas_occurrences(select = make_select(c("recordID", nbn_qa))),
         error = function(e) e
       )
       
-      if (!inherits(nbn_raw_try, "error")) {
-        nbn_raw <- nbn_raw_try
+      if (!inherits(qa_try, "error")) {
+        qa_try <- qa_try %>% distinct(recordID, .keep_all = TRUE)
+        nbn_raw <- core_try %>% left_join(qa_try, by = "recordID")
+        break
+      } else {
+        message("Fallback QA-only pull failed: ", conditionMessage(qa_try))
+        nbn_raw <- core_try
         break
       }
       
+    } else {
+      wait_s <- retry_base_wait_s * attempt
       message(
-        "NBN combined (core+QA) pull failed (attempt ", attempt, "/", max_retries, "): ",
-        conditionMessage(nbn_raw_try),
-        "\nTrying fallback: core-only + QA-only join..."
+        "NBN core pull also failed (attempt ", attempt, "/", max_retries, "): ",
+        conditionMessage(core_try),
+        " | waiting ", wait_s, "s then retrying..."
       )
-      
-      core_try <- tryCatch(
-        galah_call() |>
-          galah_identify(species_name) |>
-          atlas_occurrences(select = make_select(nbn_core)),
-        error = function(e) e
-      )
-      
-      if (!inherits(core_try, "error")) {
-        
-        qa_try <- tryCatch(
-          galah_call() |>
-            galah_identify(species_name) |>
-            atlas_occurrences(select = make_select(c("recordID", nbn_qa))),
-          error = function(e) e
-        )
-        
-        if (!inherits(qa_try, "error")) {
-          qa_try <- qa_try %>% distinct(recordID, .keep_all = TRUE)
-          nbn_raw <- core_try %>% left_join(qa_try, by = "recordID")
-          break
-        } else {
-          message("Fallback QA-only pull failed: ", conditionMessage(qa_try))
-          nbn_raw <- core_try
-          break
-        }
-        
-      } else {
-        wait_s <- retry_base_wait_s * attempt
-        message(
-          "NBN core pull also failed (attempt ", attempt, "/", max_retries, "): ",
-          conditionMessage(core_try),
-          " | waiting ", wait_s, "s then retrying..."
-        )
-        Sys.sleep(wait_s)
-      }
+      Sys.sleep(wait_s)
     }
-    
-    if (is.null(nbn_raw)) stop("NBN pull failed after retries for: ", species_name)
-    
-    safe_saveRDS(nbn_raw, nbn_ckpt_file)
-    message("Saved NBN checkpoint: ", nbn_ckpt_file)
+  }
+  
+  if (is.null(nbn_raw)) {
+    nbn_state$complete <- FALSE
+    nbn_state$last_updated <- as.character(Sys.time())
+    nbn_state$note <- "download_failed_after_retries"
+    nbn_state$last_error <- "NBN pull failed after retries"
+    safe_saveRDS(nbn_state, nbn_state_file)
+    stop("NBN pull failed after retries for: ", species_name)
   }
   
   message("NBN raw rows: ", nrow(nbn_raw))
@@ -1421,6 +1444,7 @@ pull_nbn_clean <- function(species_name,
   if (!"identificationVerificationStatus" %in% names(nbn_raw)) nbn_raw$identificationVerificationStatus <- NA_character_
   if (!"identifiedBy" %in% names(nbn_raw))                 nbn_raw$identifiedBy <- NA_character_
   
+  # Schema alignment / provenance fields (often NA for NBN)
   if (!"basisOfRecord" %in% names(nbn_raw))     nbn_raw$basisOfRecord <- NA_character_
   if (!"taxonRank" %in% names(nbn_raw))         nbn_raw$taxonRank <- NA_character_
   if (!"occurrenceStatus" %in% names(nbn_raw))  nbn_raw$occurrenceStatus <- NA_character_
@@ -1484,6 +1508,12 @@ pull_nbn_clean <- function(species_name,
   write_csv(nbn_clean, nbn_outfile)
   message("Saved NBN clean file: ", nbn_outfile)
   
+  nbn_state$complete <- TRUE
+  nbn_state$last_updated <- as.character(Sys.time())
+  nbn_state$note <- if (nrow(nbn_clean) == 0) "complete_zero_records" else "complete"
+  nbn_state$last_error <- NA_character_
+  safe_saveRDS(nbn_state, nbn_state_file)
+  
   if (nrow(nbn_clean) == 0) {
     message("[NBN] No records after coordinate screening; skipping licence checks.")
     message("NBN clean: 0 records.")
@@ -1546,10 +1576,46 @@ pull_raw_occurrences <- function(species_names,
                                  gbif_method = c("auto", "search", "download"),
                                  gbif_download_wait = FALSE,
                                  gbif_search_hard_limit = 100000L,
-                                 gbif_download_on_search_error = TRUE) {
+                                 gbif_download_on_search_error = TRUE,
+                                 skip_species_if_complete = TRUE,
+                                 cleanup_gbif_work_files = TRUE) {
   
   if (missing(nbn_email) || is.null(nbn_email) || !nzchar(nbn_email)) {
     stop("Please provide nbn_email (the email associated with your NBN Atlas account).")
+  }
+  
+  repo_root <- get_repo_root()
+  group_dir2 <- normalise_group_dir(group_dir)
+  
+  species_complete <- function(sp) {
+    slug <- slugify_species(sp)
+    
+    gbif_out_root <- if (nzchar(group_dir2)) file.path(repo_root, "data", "raw", "gbif", group_dir2) else file.path(repo_root, "data", "raw", "gbif")
+    nbn_out_root  <- if (nzchar(group_dir2)) file.path(repo_root, "data", "raw", "nbn",  group_dir2) else file.path(repo_root, "data", "raw", "nbn")
+    
+    gbif_out_dir <- if (isTRUE(species_subdir)) file.path(gbif_out_root, slug) else gbif_out_root
+    nbn_out_dir  <- if (isTRUE(species_subdir)) file.path(nbn_out_root,  slug) else nbn_out_root
+    
+    gbif_csv <- file.path(gbif_out_dir, paste0("gbif_", slug, "_clean.csv"))
+    nbn_csv  <- file.path(nbn_out_dir,  paste0("nbn_",  slug, "_clean.csv"))
+    
+    ckpt_root <- get_checkpoint_root(repo_root)
+    gbif_ckpt <- file.path(ckpt_root, "gbif", paste0("gbif_pull_checkpoint_", slug, ".rds"))
+    nbn_state <- file.path(ckpt_root, "nbn",  paste0("nbn_state_", slug, ".rds"))
+    
+    gbif_ok <- FALSE
+    if (file.exists(gbif_csv) && file.exists(gbif_ckpt)) {
+      x <- tryCatch(readRDS(gbif_ckpt), error = function(e) NULL)
+      gbif_ok <- is.list(x) && isTRUE(x$complete)
+    }
+    
+    nbn_ok <- FALSE
+    if (file.exists(nbn_csv) && file.exists(nbn_state)) {
+      y <- tryCatch(readRDS(nbn_state), error = function(e) NULL)
+      nbn_ok <- is.list(y) && isTRUE(y$complete)
+    }
+    
+    isTRUE(gbif_ok && nbn_ok)
   }
   
   out <- vector("list", length(species_names))
@@ -1560,6 +1626,15 @@ pull_raw_occurrences <- function(species_names,
   
   for (i in seq_along(species_names)) {
     sp <- species_names[i]
+    
+    if (isTRUE(skip_species_if_complete) && isTRUE(species_complete(sp))) {
+      message("\n============================================================")
+      message("Pulling raw occurrence outputs for: ", sp)
+      message("============================================================\n")
+      message("[SKIP] Outputs already complete for GBIF + NBN; moving on.")
+      next
+    }
+    
     message("\n============================================================")
     message("Pulling raw occurrence outputs for: ", sp)
     message("============================================================\n")
@@ -1577,7 +1652,8 @@ pull_raw_occurrences <- function(species_names,
       gbif_method = gbif_method,
       gbif_download_wait = gbif_download_wait,
       gbif_search_hard_limit = gbif_search_hard_limit,
-      gbif_download_on_search_error = gbif_download_on_search_error
+      gbif_download_on_search_error = gbif_download_on_search_error,
+      cleanup_gbif_work_files = cleanup_gbif_work_files
     )
     
     st <- attr(gbif_clean, "gbif_status")
@@ -1597,9 +1673,6 @@ pull_raw_occurrences <- function(species_names,
         species_subdir = species_subdir
       ),
       error = function(e) {
-        # NBN auth tokens can expire mid-run (403 / OAuth errors), and intermittent service/network
-        # issues can happen. We write a schema-correct empty output so downstream steps don't break,
-        # record what happened for the final warning, and continue to the next species.
         msg <- conditionMessage(e)
         
         reason <- if (grepl("OAuth error|authentication required|HTTP 403", msg, ignore.case = TRUE)) {
@@ -1623,16 +1696,12 @@ pull_raw_occurrences <- function(species_names,
           )
         }
         
-        group_dir2 <- normalise_group_dir(group_dir)
+        # Write an empty output so downstream steps don't break
+        group_dir3 <- normalise_group_dir(group_dir)
         slug <- slugify_species(sp)
-        nbn_out_root <- if (nzchar(group_dir2)) {
-          file.path(repo_root, "data", "raw", "nbn", group_dir2)
-        } else {
-          file.path(repo_root, "data", "raw", "nbn")
-        }
+        nbn_out_root <- if (nzchar(group_dir3)) file.path(repo_root, "data", "raw", "nbn", group_dir3) else file.path(repo_root, "data", "raw", "nbn")
         nbn_out_dir <- if (isTRUE(species_subdir)) file.path(nbn_out_root, slug) else nbn_out_root
         dir.create(nbn_out_dir, recursive = TRUE, showWarnings = FALSE)
-        
         nbn_outfile <- file.path(nbn_out_dir, paste0("nbn_", slug, "_clean.csv"))
         
         nbn_clean_fallback <- tibble::tibble(
@@ -1650,7 +1719,6 @@ pull_raw_occurrences <- function(species_names,
           coordinatePrecision = character(),
           identificationVerificationStatus = character(),
           identifiedBy = character(),
-          # Schema alignment / provenance fields (often NA for NBN)
           basisOfRecord = character(),
           taxonRank = character(),
           occurrenceStatus = character(),
@@ -1663,6 +1731,18 @@ pull_raw_occurrences <- function(species_names,
         
         readr::write_csv(nbn_clean_fallback, nbn_outfile)
         message("Saved NBN clean file (EMPTY): ", nbn_outfile)
+        
+        # Mark NBN state as incomplete so an empty file does not look "done" on the next run
+        ckpt_root <- get_checkpoint_root(repo_root)
+        nbn_state_file <- file.path(ckpt_root, "nbn", paste0("nbn_state_", slug, ".rds"))
+        dir.create(dirname(nbn_state_file), recursive = TRUE, showWarnings = FALSE)
+        nbn_state <- list(
+          complete = FALSE,
+          last_updated = as.character(Sys.time()),
+          note = "incomplete",
+          last_error = msg
+        )
+        safe_saveRDS(nbn_state, nbn_state_file)
         
         attr(nbn_clean_fallback, "nbn_status") <- list(
           state = "incomplete",
@@ -1682,9 +1762,6 @@ pull_raw_occurrences <- function(species_names,
     out[[i]] <- list(gbif_clean = gbif_clean, nbn_clean = nbn_clean)
   }
   
-  # ---------------------------------------------------------------------------
-  # Final GBIF status warning (e.g., pending downloads, retry-exhausted search)
-  # ---------------------------------------------------------------------------
   if (length(gbif_incomplete) > 0) {
     message("\n==================== GBIF WARNING ====================")
     message("Some GBIF pulls are not yet complete.")
@@ -1702,9 +1779,6 @@ pull_raw_occurrences <- function(species_names,
     message("======================================================\n")
   }
   
-  # ---------------------------------------------------------------------------
-  # Final NBN status warning (e.g., authentication required, retry-exhausted)
-  # ---------------------------------------------------------------------------
   if (length(nbn_incomplete) > 0) {
     message("\n==================== NBN WARNING ====================")
     message("Some NBN pulls did not complete (often authentication or temporary service issues).")
