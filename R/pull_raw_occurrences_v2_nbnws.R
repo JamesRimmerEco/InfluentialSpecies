@@ -1203,14 +1203,29 @@ pull_nbn_clean <- function(species_name,
     )
     
     raw <- tryCatch(
-      jsonlite::fromJSON(u),
+      jsonlite::fromJSON(u, simplifyVector = FALSE, simplifyDataFrame = FALSE),
       error = function(e) e
     )
     if (inherits(raw, "error")) stop("NBN species-ws search failed: ", conditionMessage(raw))
     
     res <- raw$searchResults$results
-    if (is.null(res)) return(data.frame())
-    as.data.frame(res, stringsAsFactors = FALSE)
+    if (is.null(res) || length(res) == 0) return(data.frame())
+    
+    get1 <- function(x, nm, alt = NULL) {
+      v <- x[[nm]]
+      if ((is.null(v) || length(v) == 0) && !is.null(alt)) v <- x[[alt]]
+      if (is.null(v) || length(v) == 0) return(NA_character_)
+      as.character(v[[1]])
+    }
+    
+    data.frame(
+      scientificName   = vapply(res, get1, character(1), nm = "scientificName", alt = "name"),
+      rank             = vapply(res, get1, character(1), nm = "rank"),
+      taxonomicStatus  = vapply(res, get1, character(1), nm = "taxonomicStatus"),
+      guid             = vapply(res, get1, character(1), nm = "guid"),
+      occurrenceCount  = suppressWarnings(as.integer(vapply(res, get1, character(1), nm = "occurrenceCount"))),
+      stringsAsFactors = FALSE
+    )
   }
   
   nbn_pick_guid <- function(res, sp) {
