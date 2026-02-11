@@ -61,6 +61,7 @@ data/_logs/
 # Meta data (ignore heavy external data)
 data/_meta/**/*.csv
 data/_meta/**/*.CSV
+data/_meta/**/*.xlsx
 
 
 
