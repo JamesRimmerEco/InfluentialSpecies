@@ -51,5 +51,13 @@ data/processed/**
 !data/processed/**/
 !data/processed/**/.gitkeep
 
+# Quarto render artefacts
+docs/*_files/
+*.html
+
+# Logs / scratch outputs
+data/_logs/
+
+
 
 

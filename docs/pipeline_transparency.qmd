@@ -1,317 +1,363 @@
 ---
 title: "Influential Species — Pipeline transparency"
-subtitle: "GBIF + NBN occurrences → QC flags → policy filter → gridded presence/background"
+subtitle: "GBIF + NBN occurrences → merge → QC flags → policy filter → gridded presence/background"
 author: "James Rimmer"
-date: "2026-02-02"
+date: "2026-02-10"
 format:
   html:
+    embed-resources: true
+    standalone: true
+    theme: cosmo
     toc: true
     toc-depth: 3
     number-sections: true
-    theme: cosmo
-    page-layout: full
+    code-fold: true
+    code-tools: true
+    mermaid:
+      theme: default
+    css: pipeline_transparency.css
 execute:
   echo: false
-  warning: false
   message: false
+  warning: false
 ---
 
 ## Purpose
 
-This document explains, in plain English, what happens at each stage of the **InfluentialSpecies** pipeline.
+This document records the key choices made in the **InfluentialSpecies** repository pipeline.
 
-It focuses on:
-
--   what each stage does,
--   what files are produced, and
--   which choices (assumptions / judgement calls) are being made.
-
-The aim is to make the workflow easy to understand for any reader, while remaining precise enough that decisions can be discussed and revised.
+Script names are provided for traceability, but the focus is on *what decisions are being made and why* rather than coding steps.
 
 ## Pipeline overview
 
-::: callout-note
-## What the pipeline does
+::: {.callout-note title="What the pipeline does"}
+For each species, occurrence records are downloaded from **GBIF** (Europe-wide first pass) and the **UK NBN Atlas**. The workflow then:
 
-For each species, we download occurrence records from GBIF (Europe-wide first pass) and from the UK NBN Atlas. We then combine those sources, apply a set of quality-control checks (which *flag* possible issues rather than deleting records), apply a policy definition for “usable” records for modelling, and finally convert the remaining point records into a gridded presence/background format.
-
-We work with "engine" scripts in /R, which do the heavy lifting, and "wrapper" scripts in /scripts, which are shorter, easier to work with, and can be easily customised with different species sets, filtering policies, tests etc. Outputs are saved to raw and processed file locations.
-
-Where the term "slug" is used, it indicates a file or folder name written to be easily read by a human rather than a computer. Specifically, slug is a placeholder for the Latin name of a given species.
+1. combines sources into a single per-species table,
+2. adds quality-control checks (these flag possible issues rather than deleting records),
+3. applies a modelling policy definition (an explicit “in/out” rule set), and
+4. converts the remaining point records into a gridded presence/background format.
 :::
 
-### Stages at a glance
+::: {.callout-tip title="Engine scripts and wrapper scripts"}
+Two script types are used:
+
+- **Engine scripts** (in `R/`) contain core functions (the heavy lifting).
+- **Wrapper scripts** (in `scripts/`) are short and user-friendly. They set species lists and key settings, then call the engine functions.
+
+This keeps the workflow reusable and makes it straightforward to run a small test set before scaling up.
+:::
+
+### Workflow diagram
+
+```{mermaid}
+%%{init: {"theme":"base","themeVariables":{"fontSize":"18px"},"flowchart":{"curve":"linear","nodeSpacing":60,"rankSpacing":90}}}%%
+flowchart TB
+  A["Stage 00 — Raw pull<br/>Download GBIF (Europe) + NBN (UK)"] --> B["Stage 01 — Merge<br/>Combine sources; remove only safest 1-to-1 duplicates"]
+  B --> C["Stage 02 — QC flags<br/>Add QC flags; do not delete records here"]
+  C --> D["Stage 03 — Policy filter<br/>Apply modelling policy (explicit 'in/out' rules)"]
+  D --> E["Stage 04 — Grid<br/>Points → regular grid (presence/count) + background grid"]
+```
+
+::: {.callout-tip title="Making the diagram larger (CSS)"}
+This document uses `pipeline_transparency.css` to control diagram size and spacing.
+
+Create this file in the same folder as this `.qmd` (typically `docs/pipeline_transparency.css`) and include:
+
+``` css
+/* pipeline_transparency.css */
+
+/* Make mermaid diagrams larger and easier to read */
+.mermaid {
+  font-size: 18px;
+}
+
+/* Ensure the SVG uses the available width */
+.mermaid svg {
+  width: 100% !important;
+  height: auto !important;
+}
+
+/* Slightly increase line thickness for readability */
+.mermaid .edgePath path {
+  stroke-width: 2px !important;
+}
+```
+:::
+
+## Stages at a glance
 
 | Stage | Plain-language description | Main output folder |
-|------------------------|------------------------|------------------------|
-| **Stage 00 — Raw pull** | Download GBIF + NBN occurrence records for a species list and save them to disk | `data/raw/` |
-| **Stage 01 — Merge** | Combine GBIF + NBN into a single per-species table (keeping provenance) | `data/processed/01_merged/` |
-| **Stage 02 — QC flags** | Run QC checks and add flags (do not delete records here) | `data/processed/02_qc_flagged/` |
-| **Stage 03 — Policy filter** | Apply a clear “in/out” policy for modelling (e.g., contemporary in-situ observations vs live specimens or fossils) | `data/processed/03_filtered/` |
-| **Stage 04 — Grid** | Convert point records into a gridded presence/background representation | `data/processed/04_grid/` |
+|---|---|---|
+| **Stage 00 — Raw pull** | Download GBIF + NBN occurrence records for a species | `data/raw/` |
+| **Stage 01 — Merge** | Combine GBIF + NBN into one table per species; drop only the safest 1-to-1 duplicates | `data/processed/01_merged/` |
+| **Stage 02 — QC flags** | Add QC flag columns (no deletion here) | `data/processed/02_qc_flagged/` |
+| **Stage 03 — Policy filter** | Apply an explicit modelling policy (the “in/out” definition) | `data/processed/03_filtered/` |
+| **Stage 04 — Grid** | Convert filtered points into a regular grid (presence/count) and a background grid | `data/processed/04_grid/` |
 
-::: {.callout-tip collapse="true"}
-## Flowchart
+------------------------------------------------------------------------
 
-``` mermaid
-flowchart TD
-  A[Stage 00: Raw pull
-Download GBIF + NBN records] --> B[Stage 01: Merge
-Combine sources into one table]
-  B --> C[Stage 02: QC flags
-Add QC flags (mostly no dropping)]
-  C --> D[Stage 03: Policy filter
-Apply modelling policy (in/out)]
-  D --> E[Stage 04: Grid
-Make 25 km (or other) grid tables/rasters]
-```
+# Stage 00 — Raw pull
+
+::: {.callout-note title="What this stage does"}
+Stage 00 downloads raw occurrence data from two sources:
+
+- **GBIF**: Europe-wide first pass (via the GBIF API)
+- **UK NBN Atlas**: UK-only (via `galah`)
+
+It writes a “raw-clean” file per species per source, with basic coordinate usability checks and only exact within-source duplicate removal.
 :::
 
-## How to read this document
+- **Engine script:** `R/pull_raw_occurrences.R`
+- **Example wrapper (100-species home-run):** `scripts/pull_raw_species_set_mapping_list_100sp_HOME_SAFE_v1.R`
+- **Outputs (example):**
+  - `data/raw/gbif/<group_dir>/gbif_<species_slug>_clean.csv`
+  - `data/raw/nbn/<group_dir>/nbn_<species_slug>_clean.csv`
 
-Each stage includes:
+## Access and credentials
 
--   **What it does** (plain language explanation)
--   **Inputs and outputs** (what information goes in and what files are produced)
--   **Key choices** (decisions that matter and affect outputs)
--   **Where it is implemented** (the relevant code locations, helpful for using the repository)
+Different sources and query sizes can require different access steps:
 
-```{r}
-# ==============================================================================
-# Small helpers used to keep parts of this document auto-updating.
-# These are intentionally minimal and are not required reading.
-# ==============================================================================
-suppressPackageStartupMessages({
-  library(data.table)
-})
+- **NBN Atlas (UK):** requires an account and login details (email, username and password). These are used by `galah` to access and download data.
 
-repo_root <- normalizePath(getwd())
+- **GBIF (Europe):** can be retrieved in two ways:
+  - **Direct API pull** for smaller result sets (fast; typically used under ~100,000 rows).
+  - **GBIF download job** for larger result sets (asynchronous; requires GBIF credentials and can take time to complete).
 
-# Read only column names from a CSV quickly (no full data load)
-csv_cols <- function(path) {
-  if (!file.exists(path)) return(character())
-  names(fread(path, nrows = 0))
-}
+The Stage 00 wrapper controls which method is used (e.g. `gbif_method = "auto"`) and whether to wait for large downloads to complete (e.g. `gbif_download_wait`).
 
-# Find the first matching file under a directory
-first_file <- function(dir_path, pattern) {
-  if (!dir.exists(dir_path)) return(NA_character_)
-  hits <- list.files(dir_path, pattern = pattern, recursive = TRUE, full.names = TRUE)
-  if (length(hits) == 0) return(NA_character_)
-  hits[[1]]
-}
+## Caching behaviour (why there is a `use_cache` switch)
 
-# Pretty, compact file path (relative if possible)
-rel_path <- function(p) {
-  if (is.na(p) || !nzchar(p)) return(NA_character_)
-  p <- normalizePath(p, winslash = "/", mustWork = FALSE)
-  root <- normalizePath(repo_root, winslash = "/", mustWork = FALSE)
-  if (startsWith(p, root)) sub(paste0("^", root, "/"), "", p) else p
-}
-```
+Stage 00 can re-use previously downloaded CSVs to avoid repeatedly querying GBIF/NBN.
 
-# Stage 00 — Raw occurrence pull (GBIF Europe + NBN UK)
+- If `use_cache = TRUE`, existing raw-clean CSVs are used when present.
+- Caching is **not blind**. If older cached files are missing newly-added QA/provenance fields (columns introduced in later revisions of the pull engine), they are treated as **stale** and will be re-pulled automatically when the upstream APIs are available (unless this is disabled).
 
-::: callout-note
-## What this stage does
+This prevents the pipeline silently running on outdated raw outputs after the pull stage has been improved.
 
-Occurrence records are downloaded for a defined list of species from:
+------------------------------------------------------------------------
 
--   **GBIF** (Europe-wide first pass), and
--   **NBN Atlas** (UK).
+# Stage 01 — Merge
 
-Outputs are saved per species and per source in a consistent table format. These raw files are kept as the “ground truth” input for everything downstream.
+::: {.callout-note title="What this stage does"}
+Stage 01 merges GBIF + NBN into a single table per species (retaining all original columns) and adds a small set of derived fields used downstream (IDs, parsed day, rounded coordinates, keys).
+
+It then performs a very conservative cross-source duplicate removal step.
 :::
 
-::: callout-tip
-## Where it is implemented
+- **Engine script:** `R/merge_dedup_occurrences.R`
+- **Example wrapper:** `scripts/merge_dedup_species_set_6sp_test.R`
+- **Inputs:** `data/raw/gbif/...` and `data/raw/nbn/...`
+- **Outputs:** `data/processed/01_merged/<species_slug>/occ_<species_slug>__merged.(parquet|rds)`
+- **Run log:** `data/processed/01_merged/_runlog_01_merged.csv`
 
--   Engine function: `R/pull_raw_occurrences.R`
--   Example wrapper: `scripts/pull_raw_species_set_6sp_test_v_2.0.R`
+## Key choice: only the safest duplicates are dropped
+
+This stage auto-drops only duplicates that meet all of the following:
+
+- exactly **1 GBIF** record and **1 NBN** record,
+- the same **rounded coordinates** (controlled by `coord_round_dp`),
+- both records have a true **day-level date** (YYYY-MM-DD; not a range/interval),
+- the non-preferred source is dropped (controlled by `prefer_source`, often GBIF).
+
+Everything else remains in the merged output (no aggressive de-duplication at this stage).
+
+------------------------------------------------------------------------
+
+# Stage 02 — QC flags
+
+::: {.callout-note title="What this stage does"}
+Stage 02 adds QC flag columns to support later filtering and diagnostics.
+
+No records are deleted here; it only annotates records with flags.
 :::
 
-## Inputs
+- **Engine script:** `R/qc_flag_occurrences.R`
+- **Example wrapper:** `scripts/qc_flag_species_set_6sp_test.R`
+- **Inputs:** `data/processed/01_merged/<species_slug>/occ_<species_slug>__merged.(parquet|rds)`
+- **Outputs:** `data/processed/02_qc_flagged/<species_slug>/occ_<species_slug>__qc_flagged.(parquet|rds)`
+- **Run log:** `data/processed/02_qc_flagged/_runlog_02_qc_flagged.csv`
 
--   **Species list** (Latin names).
--   **NBN Atlas login details** (used by the `galah` package). In practice this means an account with:
-    -   username,
-    -   password, and
-    -   the email address associated with the account.
--   **GBIF approach** (two methods are supported; see below).
--   **Cache setting** (whether to reuse previously downloaded raw files).
+## Why flags (instead of filtering) are useful
 
-::: callout-important
-## GBIF is downloaded in two different ways
+- QC problems remain visible and quantifiable (per species, per source).
+- Stage 03 policy becomes explicit and auditable (e.g. “we exclude future-dated records”).
+- Sensitivity tests become straightforward later (e.g. keep vs drop high uncertainty records).
 
-GBIF can return very large numbers of records. This pipeline supports two approaches, chosen automatically (or explicitly):
+------------------------------------------------------------------------
 
--   **Small/medium pulls (below \~100,000 rows):** the “standard API query” route.
--   **Large pulls (above \~100,000 rows):** the “GBIF download” route (asynchronous download).
+# Stage 03 — Policy filter
 
-The download route may require a GBIF account (username + password) if the code is set to use authenticated downloads.
+::: {.callout-note title="What this stage does"}
+Stage 03 applies an explicit modelling policy (“in/out” definition) to decide which records are retained for modelling.
+
+Stage 02 flags potential issues; Stage 03 is where records are removed according to agreed rules.
 :::
 
-## Outputs
+- **Engine script:** `R/filter_occurrences.R`
+- **Example wrapper:** `scripts/filter_species_set_6sp_test.R`
+- **Inputs:** `data/processed/02_qc_flagged/<species_slug>/occ_<species_slug>__qc_flagged.(parquet|rds)`
+- **Outputs:** `data/processed/03_filtered/<species_slug>/occ_<species_slug>__filtered.(parquet|rds)`
+- **Run log:** `data/processed/03_filtered/_runlog_03_filtered.csv`
 
-Raw outputs are written as CSVs to:
+## Current policy (what it does, plainly)
 
--   `data/raw/gbif/<species_slug>/gbif_<species_slug>_clean.csv`
--   `data/raw/nbn/<species_slug>/nbn_<species_slug>_clean.csv`
+The policy used in the Stage 03 wrapper is intended to:
 
-Each file is “one row per record”, with columns that include:
+- keep records only if they have usable coordinates,
+- drop clearly impossible coordinate values,
+- drop future-dated records,
+- keep records from **2000-01-01 onwards** (with a year-only fallback allowed when day-level dates are missing),
+- drop records with *reported* coordinate uncertainty greater than **1 km**,
+- keep records where uncertainty is missing (unknown uncertainty is not automatically treated as “bad”),
+- **not** restrict records by record type (records of any type can pass if they meet the coordinate/date/uncertainty rules).
 
--   coordinates (longitude/latitude),
--   dates,
--   provenance fields (source identifiers), and
--   record-type fields needed for later policy decisions (for example, the type of record and dataset information).
+## Policy “control panel”: options actually used in the wrapper
 
-## Key choices (Stage 00)
+This table covers the fields that are set in `scripts/filter_species_set_6sp_test.R` and meaningfully affect outcomes.
 
-### 00A — Spatial scope for the GBIF pull
+| Policy field | What it means in practice | Current setting |
+|---|---|---|
+| `policy_id` | Label written into outputs and the runlog; change it whenever you change any rule below | *(update label when you update the wrapper)* |
+| `keep_sources` | Restrict filtering to selected sources; `NULL` means keep all sources present | `NULL` |
+| `drop_missing_coords` | Drop if lon/lat missing (cannot map/grid) | `TRUE` |
+| `drop_coords_out_of_range` | Drop if lon outside [-180, 180] or lat outside [-90, 90] | `TRUE` |
+| `drop_future_date` | Drop if day-level date is in the future, or year is in the future | `TRUE` |
+| `drop_missing_date` | Drop only if both day-level date and year are missing | `FALSE` |
+| `min_date` | Earliest allowed day-level date (YYYY-MM-DD); set `NA` to disable | `"2000-01-01"` |
+| `max_date` | Latest allowed day-level date; `NA` disables (no upper bound) | `NA` |
+| `allow_year_only` | If day-level date missing but year exists, allow year to be used for date checks | `TRUE` |
+| `require_event_day` | If `TRUE`, drop any record without a day-level date (even if year exists) | `FALSE` |
+| `min_year`, `max_year` | Optional year limits used only for year-only records; `NA` disables | `NA`, `NA` |
+| `max_coord_uncertainty_m` | Drop if uncertainty is present and exceeds this (metres); `NA` disables | `1000` |
+| `uncertainty_missing_action` | What to do if uncertainty is missing: keep or drop | `"keep"` |
+| `gbif_issues_mode` | How to treat GBIF `issues` (see Appendix A1) | `"ignore"` |
+| `issues_blacklist` | Only used in blacklist mode; GBIF issue codes to drop | empty |
+| `drop_unexpected_licence` | Drop if `licence_expected == FALSE` (only if that field exists) | `FALSE` |
 
--   The current first pass uses GBIF’s interpreted field `continent = "EUROPE"`, alongside `hasCoordinate = TRUE`.
--   This is a pragmatic modelling extent for an initial Europe-wide run, and can be revisited later.
+## What gets logged (and why)
 
-### 00B — Caching (why it exists, and what it does)
+If `write_runlog = TRUE`, Stage 03 appends one row per species to:
 
-Pulling data from GBIF and NBN can be slow, rate-limited, or occasionally fail due to temporary API issues.
+- `data/processed/03_filtered/_runlog_03_filtered.csv`
 
--   When **caching is ON**, the pipeline will **reuse** existing raw output files if they already exist.
--   If required columns are missing (for example, because the pipeline has been updated to retain more fields), the cached file is treated as **stale** and the data are re-downloaded.
--   When **caching is OFF**, the pipeline forces a fresh pull every time.
+The run log includes:
 
-This makes runs reproducible and helps avoid repeatedly hammering external APIs.
+- `policy_id`, timestamps, species/slug, input file paths, output file paths
+- `n_in` and `n_out`
+- drop counts per rule (e.g. `dropped_future_date`, `dropped_uncertainty_high`, etc.)
 
-::: {.callout-important collapse="true"}
-## Output columns written (what this section is trying to show)
+This is the main audit trail for “what changed?” discussions.
 
-This section is here for transparency.
+------------------------------------------------------------------------
 
-Rather than asking readers to open raw CSVs, the document can list the *fields that are being retained* at Stage 00. That helps answer questions like:
+# Stage 04 — Grid (points → regular grid)
 
--   “Are we keeping enough information to justify later policy decisions?”
--   “Has the set of fields changed since the last run?”
--   “What information will Forestry England (or other collaborators) actually see in the exported tables?”
+::: {.callout-note title="What this stage does"}
+Stage 04 converts Stage 03 point occurrences into a **regular grid** that can be used as a consistent modelling unit.
 
-The list below is auto-detected from one example GBIF raw output and one example NBN raw output **if those files exist on disk**.
+For each species, the output grid covers the study extent and provides:
 
-```{r results='asis'}
-# Locate example raw files (any species)
-gbif_dir <- file.path(repo_root, "data", "raw", "gbif")
-nbn_dir  <- file.path(repo_root, "data", "raw", "nbn")
+- **presence** (1 if the species is recorded at least once in the cell, otherwise 0), and
+- **count** (how many points fell in the cell).
 
-gbif_example <- first_file(gbif_dir, pattern = "^gbif_.*_clean[.]csv$")
-nbn_example  <- first_file(nbn_dir,  pattern = "^nbn_.*_clean[.]csv$")
-
-cat("**Where this is looking:**
-
-")
-cat("- GBIF: `", rel_path(gbif_dir), "`
-", sep = "")
-cat("- NBN:  `", rel_path(nbn_dir), "`
-
-", sep = "")
-
-if (is.na(gbif_example)) {
-  cat("**GBIF example file:** not found yet (Stage 00 may not have been run on this machine).
-
-")
-} else {
-  cat("**GBIF example file:** `", rel_path(gbif_example), "`
-
-", sep = "")
-}
-
-if (is.na(nbn_example)) {
-  cat("**NBN example file:** not found yet (Stage 00 may not have been run on this machine).
-
-")
-} else {
-  cat("**NBN example file:** `", rel_path(nbn_example), "`
-
-", sep = "")
-}
-
-# Column lists
-gbif_cols <- if (!is.na(gbif_example)) csv_cols(gbif_example) else character()
-nbn_cols  <- if (!is.na(nbn_example))  csv_cols(nbn_example)  else character()
-
-if (length(gbif_cols) > 0) {
-  cat("### GBIF fields retained at Stage 00
-
-")
-  cat(paste0("- `", gbif_cols, "`
-"), sep = "")
-  cat("
-")
-}
-
-if (length(nbn_cols) > 0) {
-  cat("### NBN fields retained at Stage 00
-
-")
-  cat(paste0("- `", nbn_cols, "`
-"), sep = "")
-  cat("
-")
-}
-```
+This is still presence-only data: a 0 means “no record in that cell”, not “truly absent”.
 :::
 
-## Notes on GBIF “Europe” filter
+- **Engine script:** `R/grid_occurrences_stage03.R`  
+  (main entry point `grid_stage03_to_grid()`; optional utility `plot_europe_bbox_map()`)
+- **Example wrapper:** `scripts/grid_stage03_25km_test.R`
 
-GBIF’s `continent` field is interpreted (primarily from interpreted coordinates, otherwise interpreted country). Records with indeterminate continent (or records at sea) may not be assigned a continent value and can be excluded by this filter.
+------------------------------------------------------------------------
 
-If this becomes an issue for a particular species (e.g., coastal or island records), the spatial scope can be replaced with an explicit coordinate-based bounding box filter.
+# Implemented settings in the current test wrappers (summary)
 
-# Stage 01 — Merge (placeholder)
+This section summarises the settings currently implemented in the wrappers referenced above (i.e. the specific decisions currently coded and used in test runs).
 
-::: callout-note
-## What this stage will describe
+## Stage 00 — `scripts/pull_raw_species_set_mapping_list_100sp_HOME_SAFE_v1.R`
 
-How GBIF and NBN records are combined per species into a single table, while retaining source/provenance fields.
-:::
+- Species set: the mapping list of ~100 species (Latin names; 102 in the current wrapper).
+- `group_dir = "home_run_2026-02-06"` (stable output folder for long-running resumption).
+- NBN: `nbn_email` provided; wrapper attempts `galah_login()` once at the start (best effort).
+- Caching: `use_cache = TRUE` (reuse existing raw-clean CSVs unless treated as stale due to missing newer QA/provenance columns).
+- GBIF retrieval: `gbif_method = "auto"` (direct API pull for smaller sets; GBIF download jobs for larger sets).
+- GBIF large downloads: `gbif_download_wait = FALSE` (wrapper does not wait; it submits jobs and continues; reruns resume when ready).
 
--   Engine function: (to fill)
--   Example wrapper: (to fill)
--   Outputs: `data/processed/01_merged/<species_slug>/...`
+## Stage 03 — `scripts/filter_species_set_6sp_test.R`
 
-# Stage 02 — QC flagging (placeholder)
+The wrapper defines a single `policy <- list(...)` that holds all thresholds and switches.
 
-::: callout-note
-## What this stage will describe
+The substantive choices in the pasted script are:
 
-Which QC checks are applied (for example: missing coordinates, out-of-range coordinates, missing or implausible dates, high coordinate uncertainty).
+- keep all sources (`keep_sources = NULL`)
+- drop missing/impossible coordinates
+- drop future-dated records
+- keep records from `"2000-01-01"` onwards (with year-only fallback allowed)
+- drop uncertainty > 1 km (keep when missing)
+- ignore GBIF `issues` for now
+- do not drop based on licence at this stage
 
-The intent is generally to **flag** records rather than drop them at this step.
-:::
+------------------------------------------------------------------------
 
--   Engine function: (to fill)
--   Example wrapper: (to fill)
--   Outputs: `data/processed/02_qc_flagged/<species_slug>/...`
+# Appendix A — Supported Stage 03 options that are not part of the current policy story
 
-# Stage 03 — Policy filter (placeholder)
+This appendix documents options supported by the Stage 03 engine that are either disabled in the wrapper (set to `NULL` / `NA`) or are not used as part of the main policy explanation. They exist so the engine can support different policy choices in future, but they are not the focus of the current workflow.
 
-::: callout-note
-## What this stage will describe
+## A1. GBIF `issues`: what the modes mean (`gbif_issues_mode`)
 
-The policy definition used to decide which records are kept for modelling.
+GBIF provides an `issues` field describing warnings raised during ingestion/interpretation (often a semicolon-delimited list of codes). Many codes are common and not automatically “wrong”; they are best thought of as *notes* that may or may not matter.
 
-This includes the “in situ observation” requirement (especially for GBIF) and the rationale for any date / uncertainty constraints.
-:::
+**Modes:**
 
--   Engine function: (to fill)
--   Example wrapper: (to fill)
--   Outputs: `data/processed/03_filtered/<species_slug>/...`
+- `gbif_issues_mode = "ignore"`  
+  Keep all records regardless of `issues`.
 
-# Stage 04 — Grid (placeholder)
+- `gbif_issues_mode = "drop_any"`  
+  Drop any GBIF record where `issues` is non-empty. This is very strict and can remove large amounts of data.
 
-::: callout-note
-## What this stage will describe
+- `gbif_issues_mode = "drop_blacklist"`  
+  Drop GBIF records only if `issues` contains one or more specific codes listed in `issues_blacklist`.
 
-How point records are converted into a gridded presence/background representation (including CRS choice, modelling extent, grid resolution, and any land masking).
-:::
+**What the blacklist is (practically):**
 
--   Engine function: (to fill)
--   Example wrapper: (to fill)
--   Outputs: `data/processed/04_grid/<policy_tag>/...`
+- `issues_blacklist` is a vector of GBIF issue code strings (e.g. `"ZERO_COORDINATE"`, `"COORDINATE_OUT_OF_RANGE"`, `"RECORDED_DATE_INVALID"`).
+- In blacklist mode, a record is dropped if *any* of its issue codes match your list.
+- An empty blacklist means “drop nothing”, even in blacklist mode.
+
+## A2. Record-type gating (`allowed_basis_of_record`, `drop_basis_of_record`)
+
+`basisOfRecord` describes what sort of record it is (observation, specimen, fossil, etc.).
+
+- `allowed_basis_of_record = c(...)` means “keep only these record types; drop the rest”.
+- `drop_basis_of_record = c(...)` means “drop these record types; keep the rest”.
+
+This is a policy choice (not a technical requirement). It is not used in the current direction of the Stage 03 policy, because eligibility is driven by coordinates, date window, and uncertainty.
+
+## A3. Taxon rank gating (`allowed_taxon_rank`)
+
+`taxonRank` can be used to keep only certain ranks (e.g. only `"SPECIES"`).
+
+- `allowed_taxon_rank = c("SPECIES")` would drop subspecies/varieties if present.
+
+This can be useful, but it can also remove valid records depending on how sources populate rank. It is not used in the current wrapper policy.
+
+## A4. NBN certainty gating (`nbn_certainty_col`, `nbn_allowed_certainty`)
+
+Some NBN-derived datasets can include a certainty-like field (naming varies).
+
+- `nbn_certainty_col` is the column name to use (must exist in the merged table).
+- `nbn_allowed_certainty` is a vector of allowed values.
+
+This is only relevant if the merged schema contains a meaningful certainty field. It is not used in the current wrapper policy.
+
+## A5. Alternative date settings (less common)
+
+The current policy uses a minimum day-level date and allows year-only fallback.
+
+Other options the engine supports (not currently used) include:
+
+- setting a `max_date` to define an end-date,
+- setting `require_event_day = TRUE` to enforce day-level dates only (strict; typically reduces data),
+- setting `min_year` / `max_year` to bound year-only records more tightly.
+
+These are policy levers and should be changed only with a clear modelling reason.
