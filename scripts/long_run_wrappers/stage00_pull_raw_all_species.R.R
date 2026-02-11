@@ -54,8 +54,8 @@ if (!nzchar(Sys.getenv("INFLUENTIAL_GBIF_WORK_ROOT"))) {
 }
 
 # ---- Load engine ----
-pull_fn <- file.path(repo_root, "R", "pull_raw_occurrences.R")
-if (!file.exists(pull_fn)) stop("Can't find engine at: ", pull_fn)
+pull_fn <- file.path(repo_root, "R", "pull_raw_occurrences_v2_nbnws.R")
+if (!file.exists(pull_fn)) stop("Can't find v2 engine at: ", pull_fn)
 source(pull_fn)
 
 suppressPackageStartupMessages({
