@@ -58,6 +58,9 @@ docs/*_files/
 # Logs / scratch outputs
 data/_logs/
 
+# Meta data
+data/_meta/**
+
 
 
 
