@@ -143,18 +143,30 @@ suppressPackageStartupMessages({
   library(data.table)
 })
 
-# ---- Find this script’s directory (works when sourced from a file) ----
+# ---- Find repo root (works from any scripts/ subfolder) ----
 this_file <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
-if (is.null(this_file)) {
+if (is.null(this_file) || !nzchar(this_file)) {
   stop(
     "Can't determine script path (sys.frame(1)$ofile is NULL). ",
-    "Run this via source('.../scripts/grid_stage03_25km_test.R') from a file, not by copy/paste."
+    "Run via source('.../scripts/.../grid_stage03_25km_test.R') from a file, not copy/paste."
   )
 }
 
-script_dir <- dirname(normalizePath(this_file))
-repo_root  <- normalizePath(file.path(script_dir, ".."))
-setwd(repo_root)
+script_dir <- dirname(normalizePath(this_file, winslash = "/", mustWork = TRUE))
+
+find_repo_root <- function(start_dir) {
+  markers <- c(".git", "R", "data", "InfluentialSpecies.Rproj", "DESCRIPTION")
+  d <- start_dir
+  for (i in 1:15) {
+    if (any(file.exists(file.path(d, markers)))) return(d)
+    parent <- dirname(d)
+    if (identical(parent, d)) break
+    d <- parent
+  }
+  stop("Couldn't find repo root walking up from: ", start_dir)
+}
+
+repo_root <- find_repo_root(script_dir)
 
 # ==============================================================================
 # CONTROL PANEL
@@ -171,7 +183,7 @@ species_names <- c(
 )
 
 # ---- Where to read Stage 03 from ---------------------------------------------
-in_root <- file.path("data", "processed", "03_filtered")
+in_root <- file.path(repo_root, "data", "processed", "03_filtered")
 
 # ---- Where to write gridded outputs ------------------------------------------
 # Stage folder is generic ("04_grid"). Resolution/choices sit in the policy_tag subfolder.
@@ -203,7 +215,7 @@ plot_bbox_map <- TRUE
 # RUN
 # ==============================================================================
 
-source(file.path("R", "grid_occurrences_stage03.R"))
+source(file.path(repo_root, "R", "grid_occurrences_stage03.R"))
 
 grid_stage03_to_grid(
   species_names   = species_names,

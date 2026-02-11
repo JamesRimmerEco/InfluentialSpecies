@@ -58,8 +58,11 @@ docs/*_files/
 # Logs / scratch outputs
 data/_logs/
 
-# Meta data
-data/_meta/**
+# Meta data (ignore heavy external data)
+data/_meta/**/*.csv
+data/_meta/**/*.CSV
+
+
 
 
 

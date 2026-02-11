@@ -25,18 +25,30 @@
 #     Re-running later will incorporate new GBIF files if refresh_if_inputs_newer=TRUE.
 
 
-# ---- Find this script’s directory (works when sourced from a file) ----
+# ---- Find repo root (works from any scripts/ subfolder) ----
 this_file <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
-if (is.null(this_file)) {
+if (is.null(this_file) || !nzchar(this_file)) {
   stop(
     "Can't determine script path (sys.frame(1)$ofile is NULL). ",
-    "Run this via source('.../scripts/merge_dedup_species_set_6sp_test.R') from a file, not by copy/paste."
+    "Run via source('.../scripts/.../merge_dedup_species_set_6sp_test.R') from a file, not copy/paste."
   )
 }
 
-script_dir <- dirname(normalizePath(this_file))
-repo_root  <- normalizePath(file.path(script_dir, ".."))
-setwd(repo_root)
+script_dir <- dirname(normalizePath(this_file, winslash = "/", mustWork = TRUE))
+
+find_repo_root <- function(start_dir) {
+  markers <- c(".git", "R", "data", "InfluentialSpecies.Rproj", "DESCRIPTION")
+  d <- start_dir
+  for (i in 1:15) {
+    if (any(file.exists(file.path(d, markers)))) return(d)
+    parent <- dirname(d)
+    if (identical(parent, d)) break
+    d <- parent
+  }
+  stop("Couldn't find repo root walking up from: ", start_dir)
+}
+
+repo_root <- find_repo_root(script_dir)
 
 # ---- Load the workflow function ----
 merge_fn <- file.path(repo_root, "R", "merge_dedup_occurrences.R")
@@ -88,10 +100,10 @@ find_raw_clean_csv <- function(repo_root, raw_dir, source, group_dir, slug) {
   group_dir <- normalise_group_dir(group_dir)
   
   candidates <- c(
-    file.path(repo_root, raw_dir, src, group_dir, slug, fname),
-    file.path(repo_root, raw_dir, src, group_dir, fname),
-    file.path(repo_root, raw_dir, src, slug, fname),
-    file.path(repo_root, raw_dir, src, fname)
+    file.path(raw_dir, src, group_dir, slug, fname),
+    file.path(raw_dir, src, group_dir, fname),
+    file.path(raw_dir, src, slug, fname),
+    file.path(raw_dir, src, fname)
   )
   
   hit <- candidates[file.exists(candidates)]
@@ -100,7 +112,7 @@ find_raw_clean_csv <- function(repo_root, raw_dir, source, group_dir, slug) {
 }
 
 if (isTRUE(only_merge_if_any_input_exists)) {
-  raw_dir <- file.path("data", "raw")
+  raw_dir <- file.path(repo_root, "data", "raw")
   keep <- vapply(species_names, function(sp) {
     slug <- slugify_species(sp)
     gbif <- find_raw_clean_csv(repo_root, raw_dir, "gbif", group_dir, slug)

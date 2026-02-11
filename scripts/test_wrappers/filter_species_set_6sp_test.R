@@ -13,18 +13,31 @@
 #   data/processed/03_filtered/<slug>/occ_<slug>__filtered.(parquet|rds)
 #   data/processed/03_filtered/_runlog_03_filtered.csv              (optional)
 
-# ---- Find this script’s directory (works when sourced from a file) ----
+# ---- Find repo root (works from any scripts/ subfolder) ----
 this_file <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
-if (is.null(this_file)) {
+if (is.null(this_file) || !nzchar(this_file)) {
   stop(
     "Can't determine script path (sys.frame(1)$ofile is NULL). ",
-    "Run this via source('.../scripts/filter_species_set_6sp_test.R') from a file, not by copy/paste."
+    "Run via source('.../scripts/.../filter_species_set_6sp_test.R') from a file, not copy/paste."
   )
 }
 
-script_dir <- dirname(normalizePath(this_file))
-repo_root  <- normalizePath(file.path(script_dir, ".."))
-setwd(repo_root)
+script_dir <- dirname(normalizePath(this_file, winslash = "/", mustWork = TRUE))
+
+find_repo_root <- function(start_dir) {
+  markers <- c(".git", "R", "data", "InfluentialSpecies.Rproj", "DESCRIPTION")
+  d <- start_dir
+  for (i in 1:15) {
+    if (any(file.exists(file.path(d, markers)))) return(d)
+    parent <- dirname(d)
+    if (identical(parent, d)) break
+    d <- parent
+  }
+  stop("Couldn't find repo root walking up from: ", start_dir)
+}
+
+repo_root <- find_repo_root(script_dir)
+
 
 # ---- Load the Stage 03 engine -------------------------------------------------
 engine_fn <- file.path(repo_root, "R", "filter_occurrences.R")
@@ -189,8 +202,8 @@ policy <- list(
 # RUN SETTINGS
 # ==============================================================================
 
-in_root  <- file.path("data", "processed", "02_qc_flagged")
-out_root <- file.path("data", "processed", "03_filtered")
+in_root  <- file.path(repo_root, "data", "processed", "02_qc_flagged")
+out_root <- file.path(repo_root, "data", "processed", "03_filtered")
 
 # Stage 03 is expected to be re-run often as policy changes.
 overwrite     <- TRUE
@@ -228,7 +241,7 @@ suppressPackageStartupMessages({
   library(data.table)
 })
 
-runlog_path <- file.path(repo_root, out_root, "_runlog_03_filtered.csv")
+runlog_path <- file.path(out_root, "_runlog_03_filtered.csv")
 
 if (!file.exists(runlog_path)) {
   message("[Stage 03 summary] No runlog found at: ", runlog_path)

@@ -20,18 +20,30 @@
 #   - Re-running later will rebuild only species whose Stage 01 inputs have changed if
 #     refresh_if_inputs_newer=TRUE.
 
-# ---- Find this script’s directory (works when sourced from a file) ----
+# ---- Find repo root (works from any scripts/ subfolder) ----
 this_file <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
-if (is.null(this_file)) {
+if (is.null(this_file) || !nzchar(this_file)) {
   stop(
     "Can't determine script path (sys.frame(1)$ofile is NULL). ",
-    "Run this via source('.../scripts/qc_flag_species_set_6sp_test.R') from a file, not by copy/paste."
+    "Run via source('.../scripts/.../qc_flag_species_set_6sp_test.R') from a file, not copy/paste."
   )
 }
 
-script_dir <- dirname(normalizePath(this_file))
-repo_root  <- normalizePath(file.path(script_dir, ".."))
-setwd(repo_root)
+script_dir <- dirname(normalizePath(this_file, winslash = "/", mustWork = TRUE))
+
+find_repo_root <- function(start_dir) {
+  markers <- c(".git", "R", "data", "InfluentialSpecies.Rproj", "DESCRIPTION")
+  d <- start_dir
+  for (i in 1:15) {
+    if (any(file.exists(file.path(d, markers)))) return(d)
+    parent <- dirname(d)
+    if (identical(parent, d)) break
+    d <- parent
+  }
+  stop("Couldn't find repo root walking up from: ", start_dir)
+}
+
+repo_root <- find_repo_root(script_dir)
 
 # ---- Load the workflow function ----
 qc_fn <- file.path(repo_root, "R", "qc_flag_occurrences.R")
@@ -125,8 +137,8 @@ if (isTRUE(only_run_if_stage01_exists)) {
 qc_flag_occurrences(
   species_names              = species_names,
   group_dir                  = group_dir,
-  in_root                    = file.path("data", "processed", "01_merged"),
-  out_root                   = file.path("data", "processed", "02_qc_flagged"),
+  in_root  = file.path(repo_root, "data", "processed", "01_merged"),
+  out_root = file.path(repo_root, "data", "processed", "02_qc_flagged"),
   overwrite                  = TRUE, # Slower but necessary if upstream data are updated
   refresh_if_inputs_newer    = TRUE,
   continue_on_error          = TRUE,

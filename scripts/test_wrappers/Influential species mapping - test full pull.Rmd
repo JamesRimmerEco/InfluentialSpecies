@@ -34,6 +34,24 @@ library(stringr)
 library(lubridate)
 ```
 
+```{r}
+# ---- Repo root (robust; works from scripts/test_wrappers/ or any subfolder) ----
+find_repo_root <- function(start_dir) {
+  markers <- c(".git", "R", "data", "InfluentialSpecies.Rproj", "DESCRIPTION")
+  d <- normalizePath(start_dir, winslash = "/", mustWork = TRUE)
+  for (i in 1:15) {
+    if (any(file.exists(file.path(d, markers)))) return(d)
+    parent <- dirname(d)
+    if (identical(parent, d)) break
+    d <- parent
+  }
+  stop("Couldn't find repo root walking up from: ", start_dir)
+}
+
+repo_root <- find_repo_root(getwd())
+
+```
+
 ### Settings
 
 We set the species, geographic scope, and accepted licences for GBIF records.  
@@ -51,8 +69,8 @@ slug <- stringr::str_replace_all(tolower(species_name), "[^a-z0-9]+", "_") %>%
  # make a safe file-friendly species label (used in filenames)
 
 # Output dirs (relative to scripts/)
-gbif_out_dir <- file.path("..", "data", "raw", "gbif", "wasps")
-ckpt_root    <- file.path("..", "data", "_checkpoints")  # shared checkpoint root (outside data/raw/)
+gbif_out_dir  <- file.path(repo_root, "data", "raw", "gbif", "wasps")
+ckpt_root     <- file.path(repo_root, "data", "_checkpoints")  # shared checkpoint root
 gbif_ckpt_dir <- file.path(ckpt_root, "gbif")
 
 # GBIF batch pull settings:
@@ -341,7 +359,7 @@ nbn_email <- "jamesrimmer92@mail.com"
 allowed_licences_nbn <- c("OGL", "CC0", "CC-BY", "CC-BY-NC")
 
 # Output dirs (relative to scripts/)
-nbn_out_dir  <- file.path("..", "data", "raw", "nbn", "wasps")
+nbn_out_dir  <- file.path(repo_root, "data", "raw", "nbn", "wasps")
 nbn_ckpt_dir <- file.path(ckpt_root, "nbn")
 
 # Configure galah to use the UK atlas + provide a download reason

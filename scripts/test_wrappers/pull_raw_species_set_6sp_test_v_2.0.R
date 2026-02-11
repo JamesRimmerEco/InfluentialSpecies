@@ -8,16 +8,30 @@
 #   data/raw/nbn/<species_slug>/nbn_<species_slug>_clean.csv
 # 
 
-# ---- Find this script’s directory (works when sourced from a file) ----
+# ---- Find repo root (works from any scripts/ subfolder) ----
 this_file <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
-if (is.null(this_file)) {
-  stop("Can't determine script path (sys.frame(1)$ofile is NULL). ",
-       "Run this via source('.../scripts/pull_raw_species_set_6sp_test.R') from a file, not by copy/paste.")
+if (is.null(this_file) || !nzchar(this_file)) {
+  stop(
+    "Can't determine script path (sys.frame(1)$ofile is NULL). ",
+    "Run via source('.../scripts/.../pull_raw_species_set_6sp_test_v_2.0.R') from a file, not copy/paste."
+  )
 }
 
-script_dir <- dirname(normalizePath(this_file))
-repo_root  <- normalizePath(file.path(script_dir, ".."))
-setwd(repo_root)
+script_dir <- dirname(normalizePath(this_file, winslash = "/", mustWork = TRUE))
+
+find_repo_root <- function(start_dir) {
+  markers <- c(".git", "R", "data", "InfluentialSpecies.Rproj", "DESCRIPTION")
+  d <- start_dir
+  for (i in 1:15) {
+    if (any(file.exists(file.path(d, markers)))) return(d)
+    parent <- dirname(d)
+    if (identical(parent, d)) break
+    d <- parent
+  }
+  stop("Couldn't find repo root walking up from: ", start_dir)
+}
+
+repo_root <- find_repo_root(script_dir)
 
 # ---- Load the workflow function ----
 pull_fn <- file.path(repo_root, "R", "pull_raw_occurrences.R")

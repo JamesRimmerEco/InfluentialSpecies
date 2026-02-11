@@ -6,14 +6,33 @@
 # - Never stops on a single-species error
 # - Multi-pass loop so it can run unattended for days
 
-# ---- Find repo root (works when sourced from a file) ----
+# ---- Find repo root (works from any scripts/ subfolder) ----
 this_file <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
-if (is.null(this_file)) {
-  stop("Run this via source('.../scripts/pull_raw_species_set_mapping_list_100sp_HOME_SAFE_RESUME.R') from a file.")
+if (is.null(this_file) || !nzchar(this_file)) {
+  stop("Run this via source('.../scripts/.../stage00_pull_raw_all_species.R') (not copy/paste into console).")
 }
-script_dir <- dirname(normalizePath(this_file))
-repo_root  <- normalizePath(file.path(script_dir, ".."))
-setwd(repo_root)
+
+script_dir <- dirname(normalizePath(this_file, winslash = "/", mustWork = TRUE))
+
+find_repo_root <- function(start_dir) {
+  marker_paths <- c(
+    ".git",                 # if present locally
+    "R",                    # your engines live here
+    "data",                 # standard data dir
+    "InfluentialSpecies.Rproj",
+    "DESCRIPTION"
+  )
+  d <- start_dir
+  for (i in 1:15) { # plenty for deep nesting
+    if (any(file.exists(file.path(d, marker_paths)))) return(d)
+    parent <- dirname(d)
+    if (identical(parent, d)) break
+    d <- parent
+  }
+  stop("Couldn't find repo root walking up from: ", start_dir)
+}
+
+repo_root <- find_repo_root(script_dir)
 
 # ---- Local checkpoints (engine reads INFLUENTIAL_CHECKPOINT_ROOT) ----
 # Checkpoints are small and fast locally; the engine now cleans up big GBIF zips automatically.

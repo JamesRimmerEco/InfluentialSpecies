@@ -1,4 +1,4 @@
-# InfluentialSpecies/scripts/pull_raw_species_set_mapping_list_100sp_HOME_SAFE_v1.R
+# InfluentialSpecies/scripts/pull_raw_100sp_home_run_v2.R
 #
 # Single stable home-run wrapper (resume in one fixed folder).
 # - Always uses the same group_dir (home_run_2026-02-06 unless you change it)
@@ -8,14 +8,27 @@
 # - NBN pulls use galah where possible, with an automatic fallback to NBN web services for taxa
 #   that trigger the galah taxonomy parsing bug.
 
-# ---- Find repo root (works when sourced from a file) ----
+# ---- Find repo root (works from any scripts/ subfolder) ----
 this_file <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
-if (is.null(this_file)) {
-  stop("Run this via source('.../scripts/pull_raw_100sp_home_run_v2.R') from a file.")
+if (is.null(this_file) || !nzchar(this_file)) {
+  stop("Run this via source('.../scripts/.../pull_raw_100sp_home_run_v2.R') (not copy/paste into console).")
 }
-script_dir <- dirname(normalizePath(this_file))
-repo_root  <- normalizePath(file.path(script_dir, ".."))
-setwd(repo_root)
+
+script_dir <- dirname(normalizePath(this_file, winslash = "/", mustWork = TRUE))
+
+find_repo_root <- function(start_dir) {
+  markers <- c(".git", "R", "data", "InfluentialSpecies.Rproj", "DESCRIPTION")
+  d <- start_dir
+  for (i in 1:15) {
+    if (any(file.exists(file.path(d, markers)))) return(d)
+    parent <- dirname(d)
+    if (identical(parent, d)) break
+    d <- parent
+  }
+  stop("Couldn't find repo root walking up from: ", start_dir)
+}
+
+repo_root <- find_repo_root(script_dir)
 
 # ---- Local checkpoints (engine reads INFLUENTIAL_CHECKPOINT_ROOT) ----
 # Checkpoints are small and fast locally; the engine now cleans up big GBIF zips automatically.
@@ -38,7 +51,7 @@ if (!nzchar(Sys.getenv("INFLUENTIAL_GBIF_WORK_ROOT"))) {
 
 # ---- Load engine ----
 pull_fn <- file.path(repo_root, "R", "pull_raw_occurrences_v2_nbnws.R")
-if (!file.exists(pull_fn)) stop("Can't find engine at: ", pull_fn)
+if (!file.exists(pull_fn)) stop("Can't find engine at: ", pull_fn, " (called from ", basename(this_file), ")")
 source(pull_fn)
 
 suppressPackageStartupMessages({
