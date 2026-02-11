@@ -67,6 +67,12 @@
 #     (ii) write a per-species log file under data/raw/licence_flags/
 # ------------------------------------------------------------------------------
 
+# Guard: a broken na.print option can crash printing (error: invalid 'na.print' specification)
+opt_na_print <- getOption("na.print")
+if (!is.character(opt_na_print) || length(opt_na_print) != 1L || is.na(opt_na_print)) {
+  options(na.print = "NA")
+}
+
 suppressPackageStartupMessages({
   library(dplyr)
   library(stringr)
