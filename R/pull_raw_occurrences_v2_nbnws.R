@@ -1,4 +1,4 @@
-# InfluentialSpecies/R/pull_raw_occurrences.R
+# InfluentialSpecies/R/pull_raw_occurrences_v2_nbnws.R
 #
 # InfluentialSpecies — pull raw occurrences (GBIF + NBN Atlas) -------------------
 #
@@ -71,6 +71,14 @@
 opt_na_print <- getOption("na.print")
 if (!is.character(opt_na_print) || length(opt_na_print) != 1L || is.na(opt_na_print)) {
   options(na.print = "NA")
+}
+
+# Helper: ensure na.print is safe before any console printing of tibbles/data.frames.
+# This is defensive against sessions where options(na.print=...) has been set to an invalid value.
+ensure_safe_na_print <- function() {
+  opt <- getOption("na.print")
+  if (!is.character(opt) || length(opt) != 1L || is.na(opt)) options(na.print = "NA")
+  invisible(TRUE)
 }
 
 suppressPackageStartupMessages({
@@ -748,7 +756,17 @@ pull_gbif_clean <- function(species_name,
         message("\n[LICENCE FLAG] GBIF returned licence types outside the expected set for ", species_name, ".")
         message("Expected (normalised): ", paste(expected_licences_gbif, collapse = ", "))
         message("Top unexpected licence entries (see log for full list):")
-        print(head(unexpected_tbl, 10), n = 10)
+        
+        tryCatch(
+          {
+            ensure_safe_na_print()
+            print(dplyr::slice_head(unexpected_tbl, n = 10), n = 10)
+          },
+          error = function(e) {
+            ensure_safe_na_print()
+            message("[GBIF] NOTE: could not print unexpected licence table (", conditionMessage(e), "). Continuing.")
+          }
+        )
         
         write_unexpected_licence_log(
           species_name = species_name,
@@ -765,7 +783,18 @@ pull_gbif_clean <- function(species_name,
     }
     
     message("GBIF clean: ", nrow(gbif_clean), " records.")
-    if (nrow(gbif_clean) > 0) gbif_clean %>% count(licence, sort = TRUE) %>% print(n = 10)
+    if (nrow(gbif_clean) > 0) {
+      tryCatch(
+        {
+          ensure_safe_na_print()
+          gbif_clean %>% count(licence, sort = TRUE) %>% print(n = 10)
+        },
+        error = function(e) {
+          ensure_safe_na_print()
+          message("[GBIF] NOTE: could not print final licence table (", conditionMessage(e), "). Continuing.")
+        }
+      )
+    }
     
     return(gbif_clean)
   }
@@ -977,10 +1006,19 @@ pull_gbif_clean <- function(species_name,
   
   message("GBIF licence breakdown (RAW pull):")
   if (nrow(gbif_raw) > 0) {
-    gbif_raw %>%
-      count(license, sort = TRUE) %>%
-      mutate(prop = n / sum(n)) %>%
-      print(n = 10)
+    tryCatch(
+      {
+        ensure_safe_na_print()
+        gbif_raw %>%
+          count(license, sort = TRUE) %>%
+          mutate(prop = n / sum(n)) %>%
+          print(n = 10)
+      },
+      error = function(e) {
+        ensure_safe_na_print()
+        message("[GBIF] NOTE: could not print licence breakdown (", conditionMessage(e), "). Continuing.")
+      }
+    )
   } else {
     message("[GBIF] No rows returned in search pull.")
   }
@@ -1093,7 +1131,17 @@ pull_gbif_clean <- function(species_name,
       message("\n[LICENCE FLAG] GBIF returned licence types outside the expected set for ", species_name, ".")
       message("Expected (normalised): ", paste(expected_licences_gbif, collapse = ", "))
       message("Top unexpected licence entries (see log for full list):")
-      print(head(unexpected_tbl, 10), n = 10)
+      
+      tryCatch(
+        {
+          ensure_safe_na_print()
+          print(dplyr::slice_head(unexpected_tbl, n = 10), n = 10)
+        },
+        error = function(e) {
+          ensure_safe_na_print()
+          message("[GBIF] NOTE: could not print unexpected licence table (", conditionMessage(e), "). Continuing.")
+        }
+      )
       
       write_unexpected_licence_log(
         species_name = species_name,
@@ -1110,7 +1158,18 @@ pull_gbif_clean <- function(species_name,
   }
   
   message("GBIF clean: ", nrow(gbif_clean), " records.")
-  if (nrow(gbif_clean) > 0) gbif_clean %>% count(licence, sort = TRUE) %>% print(n = 10)
+  if (nrow(gbif_clean) > 0) {
+    tryCatch(
+      {
+        ensure_safe_na_print()
+        gbif_clean %>% count(licence, sort = TRUE) %>% print(n = 10)
+      },
+      error = function(e) {
+        ensure_safe_na_print()
+        message("[GBIF] NOTE: could not print final licence table (", conditionMessage(e), "). Continuing.")
+      }
+    )
+  }
   
   attr(gbif_clean, "gbif_status") <- list(
     state = if (isTRUE(ckpt$complete)) "complete" else "incomplete",
@@ -1132,7 +1191,8 @@ pull_nbn_clean <- function(species_name,
                            download_reason_id = 17,
                            expected_licences_nbn = c("OGL", "CC0", "CC-BY", "CC-BY-NC"),
                            use_cache = TRUE,
-                           pause_s = 0.25) {
+                           pause_s = 0.25,
+                           nbn_download_timeout_s = 3600L) {
   
   repo_root <- get_repo_root()
   group_dir <- normalise_group_dir(group_dir)
@@ -1159,7 +1219,8 @@ pull_nbn_clean <- function(species_name,
   
   # NBN completion state (small, avoids the "empty CSV looks done forever" problem)
   nbn_state_file <- file.path(nbn_ckpt_dir, paste0("nbn_state_", slug, ".rds"))
-  nbn_state <- list(complete = FALSE, last_updated = NA_character_, note = NA_character_, last_error = NA_character_)
+  nbn_state <- list(complete = FALSE, last_updated = NA_character_, note = NA_character_, last_error = NA_character_,
+                    totalRecords = NA_integer_, guid = NA_character_)
   if (file.exists(nbn_state_file)) {
     tmp <- tryCatch(readRDS(nbn_state_file), error = function(e) NULL)
     if (!is.null(tmp) && is.list(tmp)) nbn_state <- utils::modifyList(nbn_state, tmp)
@@ -1298,6 +1359,41 @@ pull_nbn_clean <- function(species_name,
     }
   }
   
+  # Choose the occurrence export file from an unzipped download.
+  # NBN downloads can include small helper CSVs (e.g. headings/citation); we need the actual occurrence table.
+  nbn_read_header_line <- function(path) {
+    tryCatch(readLines(path, n = 1, warn = FALSE, encoding = "UTF-8"), error = function(e) "")
+  }
+  
+  nbn_header_has_coords <- function(hdr) {
+    if (!nzchar(hdr)) return(FALSE)
+    h <- tolower(hdr)
+    grepl("decimallatitude|decimallongitude|gridreference|grid_ref|easting|northing", h)
+  }
+  
+  nbn_choose_occurrence_data_file <- function(files) {
+    files <- files[file.exists(files)]
+    if (length(files) == 0) return(NA_character_)
+    
+    base <- tolower(basename(files))
+    drop <- base %in% c("headings.csv", "heading.csv", "citation.csv", "citations.csv", "readme.txt", "readme.csv", "metadata.csv")
+    keep_files <- files[!drop]
+    if (length(keep_files) == 0) keep_files <- files
+    
+    hdrs <- vapply(keep_files, nbn_read_header_line, character(1))
+    has_coords <- vapply(hdrs, nbn_header_has_coords, logical(1))
+    sizes <- suppressWarnings(as.numeric(file.info(keep_files)$size))
+    sizes[is.na(sizes)] <- 0
+    
+    if (any(has_coords)) {
+      cand <- keep_files[has_coords]
+      cand_sizes <- sizes[has_coords]
+      return(cand[which.max(cand_sizes)][1])
+    }
+    
+    keep_files[which.max(sizes)][1]
+  }
+  
   nbn_standardise_ws_raw <- function(df) {
     if (!is.data.frame(df) || nrow(df) == 0) {
       out <- data.frame(
@@ -1325,14 +1421,19 @@ pull_nbn_clean <- function(species_name,
       return(out)
     }
     
+    # Case-insensitive column picker (keeps the original column name)
     pick_col <- function(candidates) {
-      hit <- intersect(candidates, names(df))
-      if (length(hit) == 0) NULL else hit[1]
+      nms <- names(df)
+      map <- stats::setNames(nms, tolower(nms))
+      cand_l <- tolower(candidates)
+      hit_l <- cand_l[cand_l %in% names(map)]
+      if (length(hit_l) == 0) return(NULL)
+      unname(map[hit_l[1]])
     }
     
     col_record <- pick_col(c("recordID", "recordId", "record_uuid", "uuid", "id"))
     col_sci    <- pick_col(c("scientificName", "scientific_name", "taxon_name", "species"))
-    col_date   <- pick_col(c("eventDate", "event_date", "eventdate", "date"))
+    col_date   <- pick_col(c("eventDate", "event_date", "eventdate", "date", "occurrence_date"))
     col_year   <- pick_col(c("year", "eventYear"))
     col_lat    <- pick_col(c("decimalLatitude", "decimal_latitude", "latitude", "lat"))
     col_lon    <- pick_col(c("decimalLongitude", "decimal_longitude", "longitude", "lon", "lng"))
@@ -1340,8 +1441,12 @@ pull_nbn_clean <- function(species_name,
     
     col_cuim   <- pick_col(c("coordinateUncertaintyInMeters", "coordinate_uncertainty_in_meters", "coord_uncertainty_m"))
     col_cp     <- pick_col(c("coordinatePrecision", "coordinate_precision"))
-    col_iv     <- pick_col(c("identificationVerificationStatus", "identification_verification_status"))
+    col_iv     <- pick_col(c("identificationVerificationStatus", "identification_verification_status", "verificationstatus", "verification_status"))
     col_idby   <- pick_col(c("identifiedBy", "identified_by"))
+    
+    # Some records-ws exports include a point field like "lat,lon" (e.g. point-1km / point-100m).
+    col_point  <- pick_col(c("point00001", "point0001", "point001", "point01", "point1", "point", "point_1km", "point_100m", "point_10m"))
+    col_grid   <- pick_col(c("gridReference", "grid_reference", "grid_ref"))
     
     # Provenance-ish fields (often absent from NBN downloads; we keep them for schema alignment)
     col_basis  <- pick_col(c("basisOfRecord", "basis_of_record"))
@@ -1353,35 +1458,105 @@ pull_nbn_clean <- function(species_name,
     col_inst   <- pick_col(c("institutionCode", "institution_code"))
     col_coll   <- pick_col(c("collectionCode", "collection_code"))
     
-    out <- df %>%
-      transmute(
-        recordID = if (!is.null(col_record)) as.character(.data[[col_record]]) else NA_character_,
-        scientificName = if (!is.null(col_sci)) as.character(.data[[col_sci]]) else species_name,
-        eventDate = if (!is.null(col_date)) as.character(.data[[col_date]]) else NA_character_,
-        year = if (!is.null(col_year)) suppressWarnings(as.integer(.data[[col_year]])) else suppressWarnings(as.integer(substr(as.character(eventDate), 1, 4))),
-        decimalLatitude = if (!is.null(col_lat)) suppressWarnings(as.numeric(.data[[col_lat]])) else NA_real_,
-        decimalLongitude = if (!is.null(col_lon)) suppressWarnings(as.numeric(.data[[col_lon]])) else NA_real_,
-        license = if (!is.null(col_lic)) as.character(.data[[col_lic]]) else NA_character_,
-        coordinateUncertaintyInMeters = if (!is.null(col_cuim)) suppressWarnings(as.numeric(.data[[col_cuim]])) else NA_real_,
-        coordinatePrecision = if (!is.null(col_cp)) as.character(.data[[col_cp]]) else NA_character_,
-        identificationVerificationStatus = if (!is.null(col_iv)) as.character(.data[[col_iv]]) else NA_character_,
-        identifiedBy = if (!is.null(col_idby)) as.character(.data[[col_idby]]) else NA_character_,
-        basisOfRecord = if (!is.null(col_basis)) as.character(.data[[col_basis]]) else NA_character_,
-        taxonRank = if (!is.null(col_rank)) as.character(.data[[col_rank]]) else NA_character_,
-        occurrenceStatus = if (!is.null(col_occst)) as.character(.data[[col_occst]]) else NA_character_,
-        datasetKey = if (!is.null(col_dk)) as.character(.data[[col_dk]]) else NA_character_,
-        datasetName = if (!is.null(col_dn)) as.character(.data[[col_dn]]) else NA_character_,
-        publishingOrgKey = if (!is.null(col_pok)) as.character(.data[[col_pok]]) else NA_character_,
-        institutionCode = if (!is.null(col_inst)) as.character(.data[[col_inst]]) else NA_character_,
-        collectionCode = if (!is.null(col_coll)) as.character(.data[[col_coll]]) else NA_character_
-      )
+    # Base extraction
+    recordID <- if (!is.null(col_record)) as.character(df[[col_record]]) else NA_character_
+    scientificName <- if (!is.null(col_sci)) as.character(df[[col_sci]]) else species_name
+    eventDate <- if (!is.null(col_date)) as.character(df[[col_date]]) else NA_character_
+    
+    year <- if (!is.null(col_year)) {
+      suppressWarnings(as.integer(df[[col_year]]))
+    } else {
+      suppressWarnings(as.integer(substr(as.character(eventDate), 1, 4)))
+    }
+    
+    lat <- if (!is.null(col_lat)) suppressWarnings(as.numeric(df[[col_lat]])) else NA_real_
+    lon <- if (!is.null(col_lon)) suppressWarnings(as.numeric(df[[col_lon]])) else NA_real_
+    
+    # Point fallback: parse "lat,lon" if decimal lat/lon were not provided or are missing.
+    if (!is.null(col_point)) {
+      x <- as.character(df[[col_point]])
+      m <- stringr::str_match(x, "^\\s*([-+]?\\d+(?:\\.\\d+)?)\\s*,\\s*([-+]?\\d+(?:\\.\\d+)?)\\s*$")
+      lat2 <- suppressWarnings(as.numeric(m[, 2]))
+      lon2 <- suppressWarnings(as.numeric(m[, 3]))
+      
+      # If values look swapped (rare), swap them back
+      swap <- !is.na(lat2) & !is.na(lon2) & (abs(lat2) > 90 & abs(lon2) <= 90)
+      if (any(swap, na.rm = TRUE)) {
+        tmp <- lat2[swap]
+        lat2[swap] <- lon2[swap]
+        lon2[swap] <- tmp
+      }
+      
+      lat[is.na(lat)] <- lat2[is.na(lat)]
+      lon[is.na(lon)] <- lon2[is.na(lon)]
+    }
+    
+    license <- if (!is.null(col_lic)) as.character(df[[col_lic]]) else NA_character_
+    cuim <- if (!is.null(col_cuim)) suppressWarnings(as.numeric(df[[col_cuim]])) else NA_real_
+    cp <- if (!is.null(col_cp)) as.character(df[[col_cp]]) else NA_character_
+    iv <- if (!is.null(col_iv)) as.character(df[[col_iv]]) else NA_character_
+    idby <- if (!is.null(col_idby)) as.character(df[[col_idby]]) else NA_character_
+    
+    basis <- if (!is.null(col_basis)) as.character(df[[col_basis]]) else NA_character_
+    rank <- if (!is.null(col_rank)) as.character(df[[col_rank]]) else NA_character_
+    occst <- if (!is.null(col_occst)) as.character(df[[col_occst]]) else NA_character_
+    dk <- if (!is.null(col_dk)) as.character(df[[col_dk]]) else NA_character_
+    dn <- if (!is.null(col_dn)) as.character(df[[col_dn]]) else NA_character_
+    pok <- if (!is.null(col_pok)) as.character(df[[col_pok]]) else NA_character_
+    inst <- if (!is.null(col_inst)) as.character(df[[col_inst]]) else NA_character_
+    coll <- if (!is.null(col_coll)) as.character(df[[col_coll]]) else NA_character_
+    
+    out <- data.frame(
+      recordID = recordID,
+      scientificName = scientificName,
+      eventDate = eventDate,
+      year = year,
+      decimalLatitude = lat,
+      decimalLongitude = lon,
+      license = license,
+      coordinateUncertaintyInMeters = cuim,
+      coordinatePrecision = cp,
+      identificationVerificationStatus = iv,
+      identifiedBy = idby,
+      basisOfRecord = basis,
+      taxonRank = rank,
+      occurrenceStatus = occst,
+      datasetKey = dk,
+      datasetName = dn,
+      publishingOrgKey = pok,
+      institutionCode = inst,
+      collectionCode = coll,
+      stringsAsFactors = FALSE
+    )
+    
+    # Keep gridReference in the raw standardisation environment if present (useful for debugging),
+    # but do not rely on it for coordinate conversion at this stage.
+    if (!is.null(col_grid) && !"gridReference" %in% names(out)) {
+      out$gridReference <- as.character(df[[col_grid]])
+    }
     
     out
   }
   
+  nbn_records_ws_total <- function(guid) {
+    u <- paste0(
+      "https://records-ws.nbnatlas.org/occurrences/search?",
+      nbn_build_query(list(
+        q = paste0("lsid:", guid),
+        fq = '-occurrence_status:"absent"',
+        pageSize = 0
+      ))
+    )
+    raw <- tryCatch(jsonlite::fromJSON(u), error = function(e) e)
+    if (inherits(raw, "error")) return(NA_integer_)
+    suppressWarnings(as.integer(raw$totalRecords))
+  }
+  
   nbn_records_ws_download <- function(guid) {
-    # Prefer the download endpoint for big species (it is designed for bulk export).
-    # If this fails (service error, temporary outage), we fall back to paged JSON search.
+    # Prefer the download endpoint for bulk export.
+    # We set dwcHeaders=true for Darwin Core names and qa=none to avoid the extra assertions file.
+    # Note: the NBN occurrence download web service is capped to 500,000 records per download.
+    # For very common taxa, this may be a truncated export (flagged later via totalRecords).
     
     work_root <- file.path(get_checkpoint_root(repo_root), "nbn_work")
     dir.create(work_root, recursive = TRUE, showWarnings = FALSE)
@@ -1392,7 +1567,9 @@ pull_nbn_clean <- function(species_name,
       fq = '-occurrence_status:"absent"',
       email = nbn_email,
       reasonTypeId = download_reason_id,
-      fileType = "csv"
+      fileType = "csv",
+      dwcHeaders = "true",
+      qa = "none"
     )
     
     dl_url <- paste0(dl_base, "?", nbn_build_query(params))
@@ -1401,14 +1578,52 @@ pull_nbn_clean <- function(species_name,
     zip_path <- file.path(work_root, paste0("nbn_download_", slug, "_", ts, ".zip"))
     unzip_dir <- file.path(work_root, paste0("nbn_download_", slug, "_", ts, "_unzipped"))
     
-    ok <- tryCatch({
-      utils::download.file(dl_url, destfile = zip_path, mode = "wb", quiet = TRUE)
-      TRUE
-    }, error = function(e) FALSE)
+    # Longer downloads are common for large taxa; raise timeout locally around the download call.
+    old_timeout <- getOption("timeout")
+    options(timeout = max(as.integer(old_timeout), as.integer(nbn_download_timeout_s)))
+    on.exit(options(timeout = old_timeout), add = TRUE)
     
-    if (!isTRUE(ok) || !file.exists(zip_path) || is.na(file.info(zip_path)$size) || file.info(zip_path)$size < 200) {
+    download_one <- function(dest) {
+      # Prefer curl if available (more robust on Windows for large files).
+      if (requireNamespace("curl", quietly = TRUE)) {
+        res <- tryCatch({
+          curl::curl_download(dl_url, destfile = dest, quiet = TRUE, mode = "wb")
+          0L
+        }, error = function(e) 1L)
+        return(res)
+      }
+      
+      rc <- tryCatch(
+        utils::download.file(dl_url, destfile = dest, mode = "wb", quiet = TRUE, method = "libcurl"),
+        warning = function(w) 1L,
+        error = function(e) 1L
+      )
+      
+      if (!identical(rc, 0L)) {
+        rc2 <- tryCatch(
+          utils::download.file(dl_url, destfile = dest, mode = "wb", quiet = TRUE),
+          warning = function(w) 1L,
+          error = function(e) 1L
+        )
+        rc <- rc2
+      }
+      
+      rc
+    }
+    
+    # Robust download handling:
+    #   - handle timeouts / transient failures with one retry
+    #   - treat non-zero return codes, missing files, or very small files as a failure
+    rc <- download_one(zip_path)
+    if (!identical(rc, 0L)) {
+      unlink(zip_path, force = TRUE)
+      Sys.sleep(2)
+      rc <- download_one(zip_path)
+    }
+    
+    if (!identical(rc, 0L) || !file.exists(zip_path) || is.na(file.info(zip_path)$size) || file.info(zip_path)$size < 200) {
       if (file.exists(zip_path)) unlink(zip_path, force = TRUE)
-      stop("NBN records-ws download failed or returned an empty stub.")
+      stop("NBN records-ws download failed or returned an empty stub (rc=", rc, ").")
     }
     
     on.exit({
@@ -1420,20 +1635,29 @@ pull_nbn_clean <- function(species_name,
       dir.create(unzip_dir, recursive = TRUE, showWarnings = FALSE)
       utils::unzip(zip_path, exdir = unzip_dir)
       
-      f <- list.files(unzip_dir, pattern = "\\.(csv|txt|tsv)$", full.names = TRUE, ignore.case = TRUE, recursive = TRUE)[1]
-      if (is.na(f) || !file.exists(f)) stop("NBN download unzip succeeded but could not find a CSV/TXT inside.")
+      files <- list.files(unzip_dir, pattern = "\\.(csv|txt|tsv)$", full.names = TRUE,
+                          ignore.case = TRUE, recursive = TRUE)
+      
+      f <- nbn_choose_occurrence_data_file(files)
+      if (is.na(f) || !file.exists(f)) stop("NBN download unzip succeeded but could not find an occurrence CSV/TXT inside.")
       
       df <- nbn_read_download_file(f)
       return(nbn_standardise_ws_raw(df))
     }
     
     # Sometimes the endpoint returns CSV directly rather than a zip; handle that too.
+    # However, the endpoint can also return an HTML error page; catch that early rather than parsing garbage.
+    snip <- tryCatch(rawToChar(readBin(zip_path, "raw", n = 200)), error = function(e) "")
+    if (nzchar(snip) && grepl("<html|service unavailable|request rejected|error", snip, ignore.case = TRUE)) {
+      stop("NBN records-ws download returned a non-zip HTML response; treating as a failure.")
+    }
+    
     df <- nbn_read_download_file(zip_path)
     nbn_standardise_ws_raw(df)
   }
   
   nbn_records_ws_search_paged <- function(guid, page_size = 1000L) {
-    # JSON paging fallback. Slower than downloads, but useful if downloads error out.
+    # JSON paging fallback. Slower than downloads, and may not support deep paging for very large result sets.
     start <- 0L
     all <- list()
     
@@ -1452,16 +1676,23 @@ pull_nbn_clean <- function(species_name,
       if (inherits(raw, "error")) stop("NBN records-ws search failed: ", conditionMessage(raw))
       
       occ <- raw$occurrences
-      if (is.null(occ) || length(occ) == 0) break
+      
+      # If the service reports totalRecords but returns no occurrences before we reach it, treat this as an early stop.
+      total <- suppressWarnings(as.integer(raw$totalRecords))
+      if (is.null(occ) || length(occ) == 0) {
+        if (!is.na(total) && isTRUE(total > start)) {
+          stop("NBN records-ws paging ended early at startIndex=", start, " but totalRecords=", total)
+        }
+        break
+      }
       
       df <- as.data.frame(occ, stringsAsFactors = FALSE)
       all[[length(all) + 1]] <- df
       
-      total <- raw$totalRecords
       got <- start + nrow(df)
-      message("[NBN] records-ws paging: ", got, " / ", total)
+      message("[NBN] records-ws paging: ", got, " / ", raw$totalRecords)
       
-      if (!is.numeric(total) || got >= total) break
+      if (!is.numeric(raw$totalRecords) || got >= raw$totalRecords) break
       
       start <- got
       Sys.sleep(pause_s)
@@ -1555,6 +1786,12 @@ pull_nbn_clean <- function(species_name,
           collectionCode = as.character(collectionCode)
         )
       
+      attr(nbn_clean, "nbn_status") <- list(
+        state = "complete",
+        note = if (!is.null(nbn_state$note)) nbn_state$note else NA_character_,
+        totalRecords = if (!is.null(nbn_state$totalRecords)) nbn_state$totalRecords else NA_integer_
+      )
+      
       return(nbn_clean)
       
     } else {
@@ -1562,6 +1799,7 @@ pull_nbn_clean <- function(species_name,
       if (isTRUE(nbn_state$complete)) {
         message("Found existing NBN clean file (EMPTY) and NBN state is complete; keeping: ", nbn_outfile)
         nbn_clean <- empty_nbn_clean()
+        attr(nbn_clean, "nbn_status") <- list(state = "complete", note = nbn_state$note, totalRecords = nbn_state$totalRecords)
         return(nbn_clean)
       } else {
         message("Found existing NBN clean file (EMPTY) but NBN state is not complete; retrying NBN pull: ", nbn_outfile)
@@ -1589,16 +1827,25 @@ pull_nbn_clean <- function(species_name,
   } else {
     message("NBN taxon search (top hit):")
     
-    if (inherits(nbn_taxa, "data.frame")) {
-      nbn_taxa %>%
-        dplyr::select(dplyr::any_of(c("scientific_name", "scientificName",
-                                      "taxon_concept_id", "taxonConceptId",
-                                      "rank"))) %>%
-        head(1) %>%
-        print(n = 1)
-    } else {
-      print(utils::head(nbn_taxa, 1))
-    }
+    tryCatch(
+      {
+        ensure_safe_na_print()
+        if (inherits(nbn_taxa, "data.frame")) {
+          nbn_taxa %>%
+            dplyr::select(dplyr::any_of(c("scientific_name", "scientificName",
+                                          "taxon_concept_id", "taxonConceptId",
+                                          "rank"))) %>%
+            head(1) %>%
+            print(n = 1)
+        } else {
+          print(utils::head(nbn_taxa, 1))
+        }
+      },
+      error = function(e) {
+        ensure_safe_na_print()
+        message("[NBN] NOTE: could not print taxon search preview (", conditionMessage(e), "). Continuing.")
+      }
+    )
     
     nbn_taxa2 <- nbn_taxa
     
@@ -1639,8 +1886,10 @@ pull_nbn_clean <- function(species_name,
         nbn_state$last_updated <- as.character(Sys.time())
         nbn_state$note <- "no_exact_species_match"
         nbn_state$last_error <- NA_character_
+        nbn_state$totalRecords <- 0L
         safe_saveRDS(nbn_state, nbn_state_file)
         
+        attr(nbn_clean, "nbn_status") <- list(state = "complete", note = nbn_state$note, totalRecords = nbn_state$totalRecords)
         return(nbn_clean)
       }
       
@@ -1799,15 +2048,28 @@ pull_nbn_clean <- function(species_name,
         nbn_state$last_updated <- as.character(Sys.time())
         nbn_state$note <- "no_exact_species_match_species_ws"
         nbn_state$last_error <- NA_character_
+        nbn_state$totalRecords <- 0L
         safe_saveRDS(nbn_state, nbn_state_file)
         
+        attr(nbn_clean, "nbn_status") <- list(state = "complete", note = nbn_state$note, totalRecords = nbn_state$totalRecords)
         return(nbn_clean)
       }
       
       message("[NBN] species-ws match GUID: ", nbn_guid)
     }
     
-    # Try bulk download first; if it errors, fall back to JSON paging.
+    # Record totalRecords for QA (also used to flag likely-truncated downloads)
+    nbn_state$guid <- nbn_guid
+    nbn_state$totalRecords <- nbn_records_ws_total(nbn_guid)
+    if (!is.na(nbn_state$totalRecords) && nbn_state$totalRecords > 500000L) {
+      message(
+        "\n[NBN] NOTE: totalRecords=", nbn_state$totalRecords,
+        " for ", species_name, ". The records-ws download endpoint is capped to 500,000 rows per download.\n",
+        "If you need full coverage for this taxon, it must be retrieved in multiple filtered downloads (e.g. by year ranges).\n"
+      )
+    }
+    
+    # Try bulk download first; if it errors, fall back to paged JSON search.
     nbn_raw <- tryCatch(nbn_records_ws_download(nbn_guid), error = function(e) e)
     
     if (inherits(nbn_raw, "error")) {
@@ -1836,7 +2098,7 @@ pull_nbn_clean <- function(species_name,
   
   message("NBN raw rows: ", nrow(nbn_raw))
   
-  lic_col <- if ("dcterms:license" %in% names(nbn_raw)) "dcterms:license" else "license"
+  lic_col <- if ("dcterms:license" %in% names(nbn_raw)) "dcterms:license" else if ("license" %in% names(nbn_raw)) "license" else "license"
   
   if (!"coordinateUncertaintyInMeters" %in% names(nbn_raw)) nbn_raw$coordinateUncertaintyInMeters <- NA_real_
   if (!"coordinatePrecision" %in% names(nbn_raw))          nbn_raw$coordinatePrecision <- NA_character_
@@ -1855,21 +2117,35 @@ pull_nbn_clean <- function(species_name,
   
   if (nrow(nbn_raw) > 0) {
     message("NBN licence breakdown (RAW pull):")
-    nbn_raw %>%
-      count(.data[[lic_col]], sort = TRUE) %>%
-      mutate(prop = n / sum(n)) %>%
-      print(n = 10)
+    
+    tryCatch(
+      {
+        ensure_safe_na_print()
+        nbn_raw %>%
+          count(.data[[lic_col]], sort = TRUE) %>%
+          mutate(prop = n / sum(n)) %>%
+          print(n = 10)
+      },
+      error = function(e) {
+        ensure_safe_na_print()
+        message("[NBN] NOTE: could not print licence breakdown (", conditionMessage(e), "). Continuing.")
+      }
+    )
   } else {
     message("[NBN] No rows returned (0 UK records is plausible for non-native taxa).")
   }
+  
+  # Harmonise name variants that show up between galah and records-ws exports
+  if (!"decimalLongitude" %in% names(nbn_raw) && "decimal_longitude" %in% names(nbn_raw)) nbn_raw$decimalLongitude <- nbn_raw$decimal_longitude
+  if (!"decimalLatitude"  %in% names(nbn_raw) && "decimal_latitude"  %in% names(nbn_raw)) nbn_raw$decimalLatitude  <- nbn_raw$decimal_latitude
   
   nbn_clean <- nbn_raw %>%
     transmute(
       source = "NBN",
       species = species_name,
       recordID = as.character(recordID),
-      lon = decimalLongitude,
-      lat = decimalLatitude,
+      lon = suppressWarnings(as.numeric(decimalLongitude)),
+      lat = suppressWarnings(as.numeric(decimalLatitude)),
       date = as.character(eventDate),
       year = as.integer(year),
       
@@ -1909,10 +2185,28 @@ pull_nbn_clean <- function(species_name,
   
   nbn_state$complete <- TRUE
   nbn_state$last_updated <- as.character(Sys.time())
-  nbn_state$note <- if (nrow(nbn_clean) == 0) "complete_zero_records" else "complete"
+  
+  # Flag likely-truncated downloads for very common taxa (the endpoint is capped to 500k).
+  # We keep the file (it is still useful), but record the condition for a later QA step.
+  if (!is.na(nbn_state$totalRecords) && nbn_state$totalRecords > 500000L) {
+    nbn_state$note <- "complete_totalRecords_gt_500k_possible_truncation"
+  } else if (nrow(nbn_clean) == 0) {
+    nbn_state$note <- "complete_zero_records"
+  } else {
+    nbn_state$note <- "complete"
+  }
+  
   if (isTRUE(nbn_use_ws)) nbn_state$note <- paste0(nbn_state$note, "_via_records_ws")
+  
   nbn_state$last_error <- NA_character_
   safe_saveRDS(nbn_state, nbn_state_file)
+  
+  attr(nbn_clean, "nbn_status") <- list(
+    state = "complete",
+    note = nbn_state$note,
+    totalRecords = nbn_state$totalRecords,
+    guid = nbn_state$guid
+  )
   
   if (nrow(nbn_clean) == 0) {
     message("[NBN] No records after coordinate screening; skipping licence checks.")
@@ -1938,7 +2232,17 @@ pull_nbn_clean <- function(species_name,
     message("\n[LICENCE FLAG] NBN returned licence types outside the expected set for ", species_name, ".")
     message("Expected (normalised): ", paste(expected_licences_nbn, collapse = ", "))
     message("Top unexpected licence entries (see log for full list):")
-    print(head(unexpected_tbl, 10), n = 10)
+    
+    tryCatch(
+      {
+        ensure_safe_na_print()
+        print(dplyr::slice_head(unexpected_tbl, n = 10), n = 10)
+      },
+      error = function(e) {
+        ensure_safe_na_print()
+        message("[NBN] NOTE: could not print unexpected licence table (", conditionMessage(e), "). Continuing.")
+      }
+    )
     
     write_unexpected_licence_log(
       species_name = species_name,
@@ -1952,7 +2256,17 @@ pull_nbn_clean <- function(species_name,
   }
   
   message("NBN clean: ", nrow(nbn_clean), " records.")
-  nbn_clean %>% count(licence, sort = TRUE) %>% print(n = 10)
+  
+  tryCatch(
+    {
+      ensure_safe_na_print()
+      nbn_clean %>% count(licence, sort = TRUE) %>% print(n = 10)
+    },
+    error = function(e) {
+      ensure_safe_na_print()
+      message("[NBN] NOTE: could not print final licence table (", conditionMessage(e), "). Continuing.")
+    }
+  )
   
   return(nbn_clean)
 }
@@ -1978,7 +2292,8 @@ pull_raw_occurrences <- function(species_names,
                                  gbif_search_hard_limit = 100000L,
                                  gbif_download_on_search_error = TRUE,
                                  skip_species_if_complete = TRUE,
-                                 cleanup_gbif_work_files = TRUE) {
+                                 cleanup_gbif_work_files = TRUE,
+                                 nbn_download_timeout_s = 3600L) {
   
   if (missing(nbn_email) || is.null(nbn_email) || !nzchar(nbn_email)) {
     stop("Please provide nbn_email (the email associated with your NBN Atlas account).")
@@ -2070,7 +2385,8 @@ pull_raw_occurrences <- function(species_names,
         expected_licences_nbn = expected_licences_nbn,
         use_cache = use_cache,
         pause_s = pause_s,
-        species_subdir = species_subdir
+        species_subdir = species_subdir,
+        nbn_download_timeout_s = nbn_download_timeout_s
       ),
       error = function(e) {
         msg <- conditionMessage(e)
@@ -2096,13 +2412,52 @@ pull_raw_occurrences <- function(species_names,
           )
         }
         
-        # Write an empty output so downstream steps don't break
+        # Write an empty output so downstream steps don't break.
+        # However, if a non-empty clean file already exists (e.g. the pull succeeded and only a final print failed),
+        # do not overwrite it with an empty file.
         group_dir3 <- normalise_group_dir(group_dir)
         slug <- slugify_species(sp)
         nbn_out_root <- if (nzchar(group_dir3)) file.path(repo_root, "data", "raw", "nbn", group_dir3) else file.path(repo_root, "data", "raw", "nbn")
         nbn_out_dir <- if (isTRUE(species_subdir)) file.path(nbn_out_root, slug) else nbn_out_root
         dir.create(nbn_out_dir, recursive = TRUE, showWarnings = FALSE)
         nbn_outfile <- file.path(nbn_out_dir, paste0("nbn_", slug, "_clean.csv"))
+        
+        existing_nonempty <- FALSE
+        existing_tbl <- NULL
+        
+        if (file.exists(nbn_outfile)) {
+          existing_tbl <- tryCatch(readr::read_csv(nbn_outfile, show_col_types = FALSE), error = function(e2) NULL)
+          if (!is.null(existing_tbl) && is.data.frame(existing_tbl) && nrow(existing_tbl) > 0) {
+            existing_nonempty <- TRUE
+          }
+        }
+        
+        if (isTRUE(existing_nonempty)) {
+          message("Found existing NBN clean file written before the error; keeping: ", nbn_outfile)
+          
+          # Mark NBN state as complete so the existing file is treated as final on the next run.
+          ckpt_root <- get_checkpoint_root(repo_root)
+          nbn_state_file <- file.path(ckpt_root, "nbn", paste0("nbn_state_", slug, ".rds"))
+          dir.create(dirname(nbn_state_file), recursive = TRUE, showWarnings = FALSE)
+          nbn_state <- list(
+            complete = TRUE,
+            last_updated = as.character(Sys.time()),
+            note = "complete_existing_csv_kept_after_error",
+            last_error = msg,
+            totalRecords = NA_integer_,
+            guid = NA_character_
+          )
+          safe_saveRDS(nbn_state, nbn_state_file)
+          
+          # Return the existing table, with an informative status attribute for the wrapper summaries.
+          attr(existing_tbl, "nbn_status") <- list(
+            state = "complete",
+            reason = "kept_existing_nonempty_csv_after_error",
+            error = msg
+          )
+          
+          return(existing_tbl)
+        }
         
         nbn_clean_fallback <- tibble::tibble(
           source = character(),
@@ -2140,7 +2495,9 @@ pull_raw_occurrences <- function(species_names,
           complete = FALSE,
           last_updated = as.character(Sys.time()),
           note = "incomplete",
-          last_error = msg
+          last_error = msg,
+          totalRecords = NA_integer_,
+          guid = NA_character_
         )
         safe_saveRDS(nbn_state, nbn_state_file)
         
