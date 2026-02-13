@@ -63,6 +63,9 @@ data/_meta/**/*.csv
 data/_meta/**/*.CSV
 data/_meta/**/*.xlsx
 
+# Stage logs (wrapper / audit / top-up)
+data/_meta/logs/
+
 
 
 
