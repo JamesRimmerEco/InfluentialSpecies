@@ -1,7 +1,7 @@
 # ==============================================================================
 # Rasterisation / gridding: what this script is doing 
 # ==============================================================================
-#
+# grid_stage03_25km_test.R
 # Goal
 # ----
 # We currently have a big table of occurrence points for each species (one row = one observation

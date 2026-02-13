@@ -1,7 +1,7 @@
 # ==============================================================================
 # Stage 04 gridding: Stage 03 filtered occurrences -> regular grid (presence/count)
 # ==============================================================================
-#
+# File - grid_occurences_stage03.R
 # This file contains the "engine" functions for Stage 04.
 # A separate wrapper script in /scripts/ sets parameters and calls these functions.
 #
