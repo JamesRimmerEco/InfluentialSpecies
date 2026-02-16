@@ -426,9 +426,56 @@ pull_gbif_clean <- function(species_name,
   # ---------------------------------------------------------------------------
   # GBIF taxon resolution
   # ---------------------------------------------------------------------------
-  bb <- name_backbone(name = species_name)
-  taxon_key <- bb$usageKey
+  clean_species_name <- function(x) {
+    # Defensive normalisation: trim, collapse whitespace, and convert non-breaking space.
+    x <- as.character(x)
+    x <- gsub("\u00A0", " ", x, fixed = TRUE)
+    x <- trimws(x)
+    x <- gsub("\\s+", " ", x)
+    x
+  }
+  
+  sp_clean <- clean_species_name(species_name)
+  bb <- tryCatch(
+    rgbif::name_backbone(name = sp_clean, kingdom = "Animalia", rank = "species"),
+    error = function(e) e
+  )
+  
+  if (inherits(bb, "error")) {
+    msg <- conditionMessage(bb)
+    message("GBIF match:  (usageKey=, matchType=)")
+    message(
+      "\n[GBIF][INCOMPLETE] Could not resolve GBIF taxonKey for ", species_name, ".\n",
+      "  Error: ", msg, "\n",
+      "Skipping GBIF pull and returning an empty output so the pipeline can continue.\n"
+    )
+    gbif_clean <- empty_gbif_clean()
+    attr(gbif_clean, "gbif_status") <- list(state = "taxon_unresolved", method = "none", expected = NA_integer_, error = msg)
+    return(gbif_clean)
+  }
+  
+  taxon_key <- if ("usageKey" %in% names(bb)) bb$usageKey[1] else NA
   message("GBIF match: ", bb$scientificName, " (usageKey=", taxon_key, ", matchType=", bb$matchType, ")")
+  
+  if (is.null(taxon_key) || length(taxon_key) != 1L || is.na(taxon_key) || !nzchar(as.character(taxon_key))) {
+    note <- if ("note" %in% names(bb)) as.character(bb$note[1]) else NA_character_
+    message(
+      "\n[GBIF][INCOMPLETE] Could not resolve a unique GBIF taxonKey for ", species_name, ".\n",
+      "Skipping GBIF pull and returning an empty output so the pipeline can continue.\n"
+    )
+    if (!is.na(note) && nzchar(note)) message("  note: ", note)
+    gbif_clean <- empty_gbif_clean()
+    attr(gbif_clean, "gbif_status") <- list(
+      state = "taxon_unresolved",
+      method = "none",
+      expected = NA_integer_,
+      matchType = as.character(bb$matchType[1]),
+      note = note
+    )
+    return(gbif_clean)
+  }
+  
+  taxon_key <- as.integer(taxon_key)
   
   # ---------------------------------------------------------------------------
   # Cache check (only trusted as "complete" if checkpoint says complete=TRUE)
