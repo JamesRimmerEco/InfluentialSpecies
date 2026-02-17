@@ -1,5 +1,5 @@
-# scripts/filter_species_set_6sp_test.R -----------------------------------------
-
+# scripts/test_wrappers/filter_species_set_6sp_test.R ---------------------------
+#
 # Stage 03: Policy filtering for a small species set (pre-rasterisation)
 #
 # Purpose:
@@ -13,6 +13,14 @@
 # Outputs:
 #   data/processed/03_filtered/<slug>/occ_<slug>__filtered.(parquet|rds)
 #   data/processed/03_filtered/_runlog_03_filtered.csv              (optional)
+#
+# Policy update (Feb 2026):
+#   Include specimen/museum-type records provided they have usable coordinates
+#   and are within the normal date window (post-2000 for now).
+#   For GBIF this is implemented via basisOfRecord inclusion + a simple provenance gate
+#   for specimen/material-sample rows.
+#
+# ------------------------------------------------------------------------------
 
 # ---- Find repo root (works from any scripts/ subfolder) ----
 this_file <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
@@ -63,6 +71,11 @@ species_names <- c(
 # ---- Stage 03 policy ----------------------------------------------------------
 # Stage 03 is policy, so every numerical decision lives here.
 # The policy_id is written to the runlog and should change if/when thresholds change.
+#
+# Notes on basisOfRecord:
+#   NBN often has basisOfRecord == NA, so we do NOT apply a global allowed_basis_of_record
+#   gate here (that would accidentally drop large amounts of NBN).
+#   Instead we enforce GBIF-specific basis/provenance rules via extra_drop_rules.
 
 policy <- list(
   # Unique label for this exact set of filtering rules.
@@ -71,7 +84,7 @@ policy <- list(
   #
   # This policy:
   #   - keeps post-2000 records (for now) with <=1 km uncertainty (where known)
-  #   - includes in-situ observations AND specimen/material-sample records
+  #   - includes in-situ observations AND specimen/material-sample records (GBIF)
   #   - requires specimen/material-sample records to have real provenance fields populated
   policy_id = "baseline_2000_unc1km_obs_plus_specimen_prov_gbif",
   
@@ -105,13 +118,7 @@ policy <- list(
   # ---- Licence handling -------------------------------------------------------
   drop_unexpected_licence = FALSE,
   
-  # ---- basisOfRecord handling (optional; applies if basisOfRecord exists) -----
-  #
-  # NOTE:
-  # NBN often has basisOfRecord == NA, so we do NOT use allowed_basis_of_record/drop_basis_of_record
-  # globally here (that would accidentally drop large amounts of NBN).
-  #
-  # Instead we enforce GBIF-specific rules in extra_drop_rules below.
+  # ---- basisOfRecord handling (global; see note above) ------------------------
   allowed_basis_of_record = NULL,
   drop_basis_of_record = NULL,
   
@@ -142,8 +149,8 @@ policy <- list(
       }
       
       is_gbif <- dt$source == "GBIF"
-      
       bor <- toupper(trimws(as.character(dt$basisOfRecord)))
+      
       allowed <- c(
         "HUMAN_OBSERVATION",
         "OBSERVATION",
@@ -164,7 +171,8 @@ policy <- list(
     #   - MATERIAL_SAMPLE
     #
     # A record passes if it has at least one "real provenance" identifier present.
-    # We accept whatever fields are available in the merged schema.
+    # This is intentionally light-touch; on our merged schema Andrena fulva had 100%
+    # provenance coverage across these fields upstream.
     drop_gbif_specimen_missing_provenance = function(dt) {
       if (!("source" %in% names(dt)) || !("basisOfRecord" %in% names(dt))) {
         return(rep(FALSE, nrow(dt)))
@@ -175,20 +183,19 @@ policy <- list(
       bor <- toupper(trimws(as.character(dt$basisOfRecord)))
       is_spec <- bor %in% c("PRESERVED_SPECIMEN", "MATERIAL_SAMPLE")
       
-      # Helper: field is present and non-empty after trimming
       has_val <- function(col) {
         if (!(col %in% names(dt))) return(rep(FALSE, nrow(dt)))
         x <- trimws(as.character(dt[[col]]))
         !is.na(x) & nzchar(x)
       }
       
+      # Use the provenance fields that actually exist in our schema.
       prov_ok <- (
         has_val("occurrenceID") |
-          has_val("catalogNumber") |
+          has_val("datasetKey") |
           has_val("institutionCode") |
           has_val("collectionCode") |
-          has_val("collectionID") |
-          has_val("datasetKey")
+          has_val("datasetName")
       )
       
       is_gbif & is_spec & !prov_ok

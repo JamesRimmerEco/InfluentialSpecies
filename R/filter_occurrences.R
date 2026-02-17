@@ -1,4 +1,5 @@
-# R/filter_occurrences.R -------------------------------------------------
+# R/filter_occurrences.R --------------------------------------------------------
+#
 # InfluentialSpecies - Stage 03: Policy filtering of QC-flagged occurrences
 #
 # Purpose:
@@ -181,9 +182,9 @@ apply_stage03_policy <- function(dt, policy) {
   keep_sources <- policy$keep_sources %||% NULL
   
   # Hard structural drops (usually TRUE)
-  drop_missing_coords     <- isTRUE(policy$drop_missing_coords %||% TRUE)
-  drop_coords_out_of_range<- isTRUE(policy$drop_coords_out_of_range %||% TRUE)
-  drop_future_date        <- isTRUE(policy$drop_future_date %||% TRUE)
+  drop_missing_coords      <- isTRUE(policy$drop_missing_coords %||% TRUE)
+  drop_coords_out_of_range <- isTRUE(policy$drop_coords_out_of_range %||% TRUE)
+  drop_future_date         <- isTRUE(policy$drop_future_date %||% TRUE)
   
   # Date completeness and window
   drop_missing_date <- isTRUE(policy$drop_missing_date %||% FALSE)
@@ -420,6 +421,7 @@ apply_stage03_policy <- function(dt, policy) {
       stats[["dropped_gbif_any_issues"]] <- 0L
       stats[["dropped_gbif_blacklisted_issues"]] <- 0L
     }
+    
   } else {
     stats[["dropped_gbif_any_issues"]] <- 0L
     stats[["dropped_gbif_blacklisted_issues"]] <- 0L
