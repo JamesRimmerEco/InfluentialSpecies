@@ -157,7 +157,7 @@ policy <- list(
         "MACHINE_OBSERVATION",
         "PRESERVED_SPECIMEN",
         "MATERIAL_SAMPLE"
-        # If you later decide these should count too, add here:
+        # If we later decide these should count too, add here:
         # "LIVING_SPECIMEN"
       )
       
