@@ -1,7 +1,7 @@
 # R/grid_occurrences_stage03_v02_first_observed.R
 #
 # ==============================================================================
-# Stage 04 gridding engine: Stage 03 filtered occurrences -> regular grid outputs
+# Stage 03 filtered occurrences -> regular grid outputs
 # ==============================================================================
 #
 # Key design choice
