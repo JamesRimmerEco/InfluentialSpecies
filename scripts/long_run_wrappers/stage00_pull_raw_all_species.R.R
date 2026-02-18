@@ -116,14 +116,20 @@ write_heartbeat <- function(state) {
 species_csv <- file.path(repo_root, "data", "_meta", "species_list_binomial.csv")
 if (!file.exists(species_csv)) stop("Binomial species list not found at: ", species_csv)
 
-sp_df <- readr::read_csv(species_csv, show_col_types = FALSE)
-species_names <- sp_df[[1]] %>%
+sp_df <- readr::read_csv(
+  species_csv,
+  col_names = "binomial",
+  show_col_types = FALSE,
+  trim_ws = TRUE,
+  progress = FALSE
+)
+
+species_names <- sp_df$binomial %>%
   as.character() %>%
   stringr::str_trim()
 
-# Drop empties and any accidental header-as-row
+# Drop empties (file is headerless, one binomial per line)
 species_names <- species_names[!is.na(species_names) & nzchar(species_names)]
-species_names <- species_names[tolower(species_names) != "binomial"]
 
 # Enforce binomial shape (fail fast if the file is wrong)
 is_binom <- grepl("^[A-Z][a-z-]+\\s+[a-z-]+$", species_names)
