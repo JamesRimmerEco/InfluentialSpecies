@@ -162,9 +162,10 @@ if (length(missing_cols) > 0) {
 }
 
 worklist <- manifest %>%
-  rowwise() %>%
-  mutate(.do = process_if(cur_data())) %>%
-  ungroup() %>%
+  mutate(
+    .do = (topup_recommended %in% TRUE) |
+      (nbn_status %in% c("missing_file", "unreadable", "missing_required_columns"))
+  ) %>%
   filter(.do) %>%
   select(species, slug, nbn_status, topup_recommended)
 
@@ -520,10 +521,10 @@ for (i in seq_len(nrow(worklist))) {
   
   # Load existing output (if present)
   out_file <- file.path(nbn_run_dir, paste0("nbn_", slug, "_clean.csv"))
-  existing <- NULL
-  if (file.exists(out_file)) {
-    existing <- tryCatch(readr::read_csv(out_file, show_col_types = FALSE), error = function(e) NULL)
-  }
+  existing <- tryCatch(
+    readr::read_csv(out_file, show_col_types = FALSE, col_types = cols(date = col_character())),
+    error = function(e) NULL
+  )
   
   new_rows_total <- 0L
   chunks_done_now <- 0L
@@ -575,10 +576,16 @@ for (i in seq_len(nrow(worklist))) {
       next
     }
     
-    # Append into accumulator
+    # Append into accumulator (force stable types to avoid bind_rows Date/character clashes)
     if (is.null(existing)) {
       existing <- std
     } else {
+      if ("date" %in% names(existing)) existing$date <- as.character(existing$date)
+      if ("date" %in% names(std))      std$date      <- as.character(std$date)
+      
+      if ("year" %in% names(existing)) existing$year <- suppressWarnings(as.integer(existing$year))
+      if ("year" %in% names(std))      std$year      <- suppressWarnings(as.integer(std$year))
+      
       existing <- bind_rows(existing, std)
     }
     
