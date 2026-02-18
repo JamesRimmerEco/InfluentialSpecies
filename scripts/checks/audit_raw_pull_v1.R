@@ -46,12 +46,16 @@ audits_dir <- file.path(meta_dir, "audits")
 gbif_run_dir <- file.path(repo_root, "data", "raw", "gbif", group_dir)
 nbn_run_dir  <- file.path(repo_root, "data", "raw", "nbn",  group_dir)
 
-# Meta list (Excel). If missing, script tries to find an .xlsx in data/_meta/.
-meta_species_file <- file.path(meta_dir, "Influential Species Mapping List.xlsx")
-meta_sheet <- NULL          # NULL = first sheet
+# Meta list (canonical): headerless binomial CSV (one species per line).
+# This is the authoritative list used to name/slug Stage 0 outputs.
+meta_species_file <- file.path(meta_dir, "species_list_binomial.csv")
+
+# Kept for compatibility if you swap back to Excel later (ignored for the headerless CSV).
+meta_sheet <- NULL
+meta_species_col <- "species"
 
 # IMPORTANT:
-#   Your current Excel has blank header cells that readxl names as ...1, ...2, ...3, etc.
+#   Our current Excel has blank header cells that readxl names as ...1, ...2, ...3, etc.
 #   In your sheet, the authoritative binomial column is currently called "...4".
 #   (Best long-term fix is to rename that header in Excel to e.g. "ScientificName".)
 meta_species_col <- "Species"
@@ -170,11 +174,40 @@ find_meta_xlsx <- function(meta_dir) {
 #   - If the cell contains "Common name (Genus species)" we extract the binomial in parentheses.
 #   - Otherwise we take the first two tokens that look like a binomial from the start of the string.
 read_meta_species <- function(xlsx_path, sheet = NULL, species_col = NULL) {
+  
+  if (!file.exists(xlsx_path)) {
+    stop("Meta species file not found at: ", xlsx_path, call. = FALSE)
+  }
+  
+  ext <- tolower(tools::file_ext(xlsx_path))
+  
+  # ---- Canonical binomial CSV (headerless, single column) ---------------------
+  if (ext == "csv") {
+    
+    df <- readr::read_csv(
+      xlsx_path,
+      col_names = "species",
+      show_col_types = FALSE,
+      trim_ws = TRUE,
+      progress = FALSE
+    )
+    
+    sp <- df$species %>%
+      as.character() %>%
+      stringr::str_trim()
+    
+    sp <- sp[!is.na(sp) & nzchar(sp)]
+    sp <- unique(sp)
+    
+    message("Meta species source used: ", basename(xlsx_path), " (headerless CSV)")
+    message("Meta species count (unique): ", length(sp))
+    
+    return(sp)
+  }
+  
+  # ---- Excel meta sheet (fallback / legacy) ----------------------------------
   if (!requireNamespace("readxl", quietly = TRUE)) {
     stop("Package 'readxl' is required to read the meta Excel file. Please install it.", call. = FALSE)
-  }
-  if (!file.exists(xlsx_path)) {
-    stop("Meta species Excel file not found at: ", xlsx_path, call. = FALSE)
   }
   
   df <- readxl::read_excel(xlsx_path, sheet = sheet %||% 1)
@@ -183,8 +216,6 @@ read_meta_species <- function(xlsx_path, sheet = NULL, species_col = NULL) {
   nm <- names(df)
   
   if (is.null(species_col)) {
-    # Heuristic: choose the first column whose name includes "species" (case-insensitive),
-    # otherwise fallback to the first column.
     hit <- nm[str_detect(tolower(nm), "species")]
     species_col <- if (length(hit) == 0) nm[1] else hit[1]
   }
@@ -195,15 +226,12 @@ read_meta_species <- function(xlsx_path, sheet = NULL, species_col = NULL) {
     as.character() %>%
     stringr::str_trim()
   
-  # Drop empty rows only
   sp_raw <- sp_raw[!is.na(sp_raw) & nzchar(sp_raw)]
   
   extract_binomial <- function(x) {
-    # Pull "(Genus species)" if present
     m <- stringr::str_match(x, "\\(([A-Z][a-z-]+\\s+[a-z-]+)\\)")
     if (!is.na(m[, 2])) return(m[, 2])
     
-    # Otherwise take "Genus species" from the start of the string
     m2 <- stringr::str_match(x, "^([A-Z][a-z-]+)\\s+([a-z-]+)")
     if (!is.na(m2[, 1])) return(paste(m2[, 2], m2[, 3]))
     
@@ -581,7 +609,7 @@ message("NBN : ok ", nbn_counts$ok %||% 0, "/", N,
 message("Stage 2 merge-ready: ", stage2_ok_n, "/", N)
 
 if (isTRUE(do_nbn_online_probe)) {
-  cap_risk_n <- sum(isTRUE(manifest_out$nbn_cap_risk), na.rm = TRUE)
+  cap_risk_n <- sum(manifest_out$nbn_cap_risk %in% TRUE, na.rm = TRUE)
   probed_n <- sum(manifest_out$nbn_status %in% c("ok","empty_file"))
   message("NBN cap-risk (online): ", cap_risk_n, " (probed ", probed_n, " species)")
 } else {
