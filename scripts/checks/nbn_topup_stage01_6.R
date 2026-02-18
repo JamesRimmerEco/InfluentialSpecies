@@ -75,6 +75,12 @@ download_reason_id <- 10
 # Optional: only do a dry run (plan chunks + print, no downloads)
 dry_run <- FALSE
 
+# Download robustness
+dl_max_tries         <- 4L     # total attempts per chunk
+dl_backoff_base_sec  <- 4L     # base sleep; grows with attempt
+dl_min_zip_bytes     <- 1000L  # treat zips smaller than this as suspicious
+dl_debug_keep_failed <- TRUE   # keep failed payloads (html/txt) for inspection
+
 # ---- Repo paths ---------------------------------------------------------------
 
 repo_root <- getwd()
@@ -105,6 +111,8 @@ dir.create(nbn_topup_ckpt_dir, recursive = TRUE, showWarnings = FALSE)
 
 # ---- Helpers -----------------------------------------------------------------
 
+`%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
+
 slugify_species <- function(species_name) {
   slug <- str_replace_all(tolower(species_name), "[^a-z0-9]+", "_")
   slug <- str_replace_all(slug, "^_+|_+$", "")
@@ -131,7 +139,32 @@ nbn_build_query <- function(params) {
   paste(parts, collapse = "&")
 }
 
-`%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
+http_head_status <- function(url) {
+  if (!requireNamespace("curl", quietly = TRUE)) return(NA_integer_)
+  h <- curl::new_handle(nobody = TRUE, followlocation = TRUE)
+  curl::handle_setopt(h, connecttimeout = 30, timeout = 60)
+  res <- tryCatch(curl::curl_fetch_memory(url, handle = h), error = function(e) NULL)
+  if (is.null(res)) return(NA_integer_)
+  suppressWarnings(as.integer(res$status_code))
+}
+
+looks_like_html <- function(path, n = 6L) {
+  if (!file.exists(path)) return(FALSE)
+  x <- tryCatch(readLines(path, n = n, warn = FALSE), error = function(e) character(0))
+  if (length(x) == 0) return(FALSE)
+  any(grepl("<!DOCTYPE html|<html|<head|<body", x, ignore.case = TRUE))
+}
+
+save_failed_payload_preview <- function(path, out_path) {
+  if (!file.exists(path)) return(FALSE)
+  ok <- tryCatch({ file.copy(path, out_path, overwrite = TRUE); TRUE }, error = function(e) FALSE)
+  if (!isTRUE(ok)) return(FALSE)
+  prev <- tryCatch(readLines(out_path, n = 80, warn = FALSE), error = function(e) character(0))
+  if (length(prev)) {
+    tryCatch(writeLines(prev, paste0(out_path, ".preview.txt")), error = function(e) NULL)
+  }
+  TRUE
+}
 
 # ---- Stage 1.5 manifest discovery --------------------------------------------
 
@@ -266,26 +299,104 @@ nbn_records_ws_download_chunk <- function(guid, fq_vec, work_root, slug) {
   )
   dl_url <- paste0(dl_base, "?", nbn_build_query(params))
   
-  ts <- format(Sys.time(), "%Y%m%d%H%M%S")
-  zip_path <- file.path(work_root, paste0("nbn_topup_", slug, "_", ts, ".zip"))
-  unzip_dir <- file.path(work_root, paste0("nbn_topup_", slug, "_", ts, "_unzipped"))
-  
-  ok <- download_zip(dl_url, zip_path)
-  if (!ok || !file.exists(zip_path) || file.info(zip_path)$size < 100) {
-    return(list(ok = FALSE, zip_path = zip_path, csv_path = NA_character_, unzip_dir = unzip_dir, error = "Download failed/empty"))
+  mk_tag <- function() {
+    paste0(format(Sys.time(), "%Y%m%d%H%M%S"), "_", sprintf("%06d", sample.int(999999L, 1L)))
   }
   
-  dir.create(unzip_dir, recursive = TRUE, showWarnings = FALSE)
-  utils::unzip(zip_path, exdir = unzip_dir)
+  last_err <- NA_character_
+  last_http <- NA_integer_
   
-  csvs <- list.files(unzip_dir, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
-  if (length(csvs) == 0) {
-    return(list(ok = FALSE, zip_path = zip_path, csv_path = NA_character_, unzip_dir = unzip_dir, error = "No CSV in zip"))
+  for (attempt in seq_len(dl_max_tries)) {
+    tag <- mk_tag()
+    zip_path <- file.path(work_root, paste0("nbn_topup_", slug, "_", tag, ".zip"))
+    unzip_dir <- file.path(work_root, paste0("nbn_topup_", slug, "_", tag, "_unzipped"))
+    
+    ok <- download_zip(dl_url, zip_path)
+    
+    if (!file.exists(zip_path) || is.na(file.info(zip_path)$size)) {
+      last_http <- http_head_status(dl_url)
+      last_err <- paste0("zip_missing (http=", last_http %||% NA_integer_, ")")
+    } else {
+      sz <- file.info(zip_path)$size
+      
+      if (looks_like_html(zip_path)) {
+        last_http <- http_head_status(dl_url)
+        last_err <- paste0("not_a_zip_html (bytes=", sz, "; http=", last_http %||% NA_integer_, ")")
+        if (isTRUE(dl_debug_keep_failed)) {
+          save_failed_payload_preview(
+            zip_path,
+            file.path(work_root, paste0("FAILED_", slug, "_", tag, ".html"))
+          )
+        }
+      } else if (sz < dl_min_zip_bytes) {
+        last_http <- http_head_status(dl_url)
+        last_err <- paste0("zip_too_small (bytes=", sz, "; http=", last_http %||% NA_integer_, ")")
+      } else {
+        dir.create(unzip_dir, recursive = TRUE, showWarnings = FALSE)
+        
+        unz_ok <- tryCatch({
+          utils::unzip(zip_path, exdir = unzip_dir)
+          TRUE
+        }, error = function(e) FALSE)
+        
+        if (!isTRUE(unz_ok)) {
+          last_http <- http_head_status(dl_url)
+          last_err <- paste0("unzip_failed (http=", last_http %||% NA_integer_, ")")
+        } else {
+          csv_path <- file.path(unzip_dir, "data.csv")
+          if (!file.exists(csv_path)) {
+            csvs <- list.files(unzip_dir, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
+            if (length(csvs) == 0) {
+              last_err <- "no_csv_in_zip"
+              csv_path <- NA_character_
+            } else {
+              csv_path <- csvs[which.max(file.info(csvs)$size)]
+            }
+          }
+          
+          if (!is.na(csv_path) && file.exists(csv_path)) {
+            n2 <- tryCatch(length(readLines(csv_path, n = 2, warn = FALSE)), error = function(e) 0L)
+            if (n2 >= 2) {
+              return(list(
+                ok = TRUE,
+                zip_path = zip_path,
+                csv_path = csv_path,
+                unzip_dir = unzip_dir,
+                error = NA_character_,
+                http = last_http %||% NA_integer_,
+                attempt = attempt,
+                url = dl_url
+              ))
+            } else {
+              last_err <- "csv_no_rows"
+            }
+          } else if (is.na(csv_path)) {
+            last_err <- last_err %||% "csv_missing_after_unzip"
+          } else {
+            last_err <- "csv_missing_after_unzip"
+          }
+        }
+      }
+    }
+    
+    if (attempt < dl_max_tries) {
+      sleep_s <- dl_backoff_base_sec * attempt
+      message("[1.6]     Retry ", attempt, "/", dl_max_tries - 1L,
+              " after ", sleep_s, "s (", last_err, ")")
+      Sys.sleep(sleep_s)
+    }
   }
   
-  # pick the largest CSV in case there are multiple
-  csv_path <- csvs[which.max(file.info(csvs)$size)]
-  list(ok = TRUE, zip_path = zip_path, csv_path = csv_path, unzip_dir = unzip_dir, error = NA_character_)
+  list(
+    ok = FALSE,
+    zip_path = NA_character_,
+    csv_path = NA_character_,
+    unzip_dir = NA_character_,
+    error = paste0("Download failed after ", dl_max_tries, " tries: ", last_err),
+    http = last_http %||% NA_integer_,
+    attempt = dl_max_tries,
+    url = dl_url
+  )
 }
 
 # ---- Standardise records-ws CSV to Stage 1 NBN schema -------------------------
@@ -324,6 +435,7 @@ standardise_nbn_records_ws_df <- function(df, species_name) {
   recordID <- if (!is.null(col_record)) as.character(df[[col_record]]) else NA_character_
   scientificName <- if (!is.null(col_sci)) as.character(df[[col_sci]]) else species_name
   eventDate <- if (!is.null(col_date)) as.character(df[[col_date]]) else NA_character_
+  eventDate <- as.character(eventDate)  # ensure always character (even if readr parsed Date)
   
   year <- if (!is.null(col_year)) {
     suppressWarnings(as.integer(df[[col_year]]))
@@ -549,7 +661,8 @@ for (i in seq_len(nrow(worklist))) {
     dl <- nbn_records_ws_download_chunk(guid, fq_vec, work_root = work_root, slug = slug)
     
     if (!isTRUE(dl$ok)) {
-      message("[1.6]     FAILED: ", dl$error)
+      msg_http <- if (!is.null(dl$http) && !is.na(dl$http)) paste0(" (http=", dl$http, ")") else ""
+      message("[1.6]     FAILED: ", dl$error, msg_http)
       errors_now <- c(errors_now, paste0(k, ":", dl$error))
       state$last_error <- dl$error
       write_state(slug, state)
