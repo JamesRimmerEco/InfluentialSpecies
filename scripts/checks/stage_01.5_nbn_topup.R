@@ -1,10 +1,10 @@
-# scripts/checks/nbn_topup_stage01_6.R
+# scripts/checks/stage_01.5_nbn_topup.R
 #
-# InfluentialSpecies — Stage 1.6 (NBN top-up / repair)
+# InfluentialSpecies — Stage 1 (NBN top-up / repair)
 #
 # Purpose
-#   Stage 1.5 tells you which species are missing / risky / cap-risk after a Stage 1 raw pull.
-#   Stage 1.6 takes the Stage 1.5 manifest and *repairs NBN only* by re-downloading NBN
+#   Stage 1 tells you which species are missing / risky / cap-risk after a Stage 1 raw pull.
+#   Stage 1.5 takes the Stage 1 manifest and repairs NBN only by re-downloading NBN
 #   occurrences in year-range chunks to avoid the ~500k cap, then appends + de-duplicates
 #   into the existing per-species NBN clean CSV (same schema as Stage 1).
 #

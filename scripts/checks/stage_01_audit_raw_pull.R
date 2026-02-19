@@ -1,15 +1,15 @@
-# audit_raw_pull_v1.R
+# stage_01_audit_raw_pull.R
 #
-# InfluentialSpecies — Stage 1.5 audit (read-only)
+# InfluentialSpecies — Stage 1 audit (read-only)
 #
 # Goal (what this is for)
-#   Given a *single* raw pull run folder (group_dir), quickly answer:
+#   Given a single raw pull run folder (group_dir), quickly answer:
 #     - Did we produce the expected GBIF + NBN outputs for every species in the meta list?
 #     - Are those outputs "merge-ready" for Stage 2 (i.e., have required columns)?
 #     - Which species should Stage 1.6 (NBN top-up) attempt to repair / extend?
 #
 # Design principles
-#   - One primary output file: a single "manifest" CSV (human-readable *and* machine-consumable for Stage 1.6).
+#   - One primary output file: a single "manifest" CSV (human-readable *and* machine-consumable for Stage 1.5).
 #   - The first columns carry the headline status; details are kept to the right.
 #   - Console prints a compact scoreboard (X/N ok, missing, empty, etc.).
 #   - Extra columns in CSVs are allowed (we only enforce required columns).
