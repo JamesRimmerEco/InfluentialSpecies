@@ -63,7 +63,7 @@ suppressPackageStartupMessages({
 # - group_dir is ONLY for locating raw inputs.
 # - If Stage 00 wrote into data/raw/<src>/<group_dir>/..., set group_dir accordingly.
 # - If Stage 00 wrote straight into data/raw/<src>/..., set group_dir <- "".
-group_dir <- ""   # <-- set this to e.g. "home_run_true_list" if you pulled into grouped raw folders
+group_dir <- "home_run_true_list" # <-- set this to e.g. "home_run_true_list" if pulled into grouped raw folders
 
 # Conservative duplicate rule settings (should match your canonical engine defaults)
 coord_round_dp <- 4
