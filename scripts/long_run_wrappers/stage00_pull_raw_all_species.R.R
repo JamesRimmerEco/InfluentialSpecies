@@ -1,10 +1,10 @@
-# InfluentialSpecies/scripts/pull_raw_species_set_mapping_list_TRUE_HOME_SAFE_v1.R
+# InfluentialSpecies/scripts/stage_00_pull_raw_all_species.R
 #
 # Single stable home-run wrapper (resume in one fixed folder).
 #
 # What this wrapper does
-# - Loads the authoritative species list from the project meta Excel (no hard-coded species vector).
-# - Calls the Stage 1 engine (pull_raw_occurrences_v2_nbnws.R) in multi-pass mode so it can run unattended.
+# - Loads the authoritative species list from the project meta CSV (no hard-coded species vector).
+# - Calls the Stage 00 engine (pull_raw_occurrences_v2_nbnws.R) in multi-pass mode so it can run unattended.
 # - The engine decides whether each species is already complete (GBIF checkpoint + NBN state) and skips when safe.
 # - Never stops on a single-species error; errors are logged and the loop continues.
 #
@@ -15,7 +15,7 @@
 # ---- Find repo root (works from any scripts/ subfolder) ----
 this_file <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
 if (is.null(this_file) || !nzchar(this_file)) {
-  stop("Run this via source('.../scripts/.../pull_raw_species_set_mapping_list_TRUE_HOME_SAFE_v1.R') (not copy/paste into console).")
+  stop("Run this via source('.../scripts/.../stage_00_pull_raw_all_species.R') (not copy/paste into console).")
 }
 script_dir <- dirname(normalizePath(this_file, winslash = "/", mustWork = TRUE))
 
@@ -67,7 +67,7 @@ suppressPackageStartupMessages({
   library(galah)
   library(rgbif)
   library(readxl)
-  library(readr) 
+  library(readr)
   library(stringr)
   library(dplyr)
 })
@@ -89,8 +89,8 @@ log_dir <- file.path(repo_root, "data", "_meta", "logs")
 dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
 
 timestamp_tag <- format(Sys.time(), "%Y-%m-%d_%H%M%S")
-log_file <- file.path(log_dir, paste0("wrapper_stage01_", group_dir, "_", timestamp_tag, ".log"))
-hb_file  <- file.path(log_dir, paste0("wrapper_stage01_", group_dir, "_heartbeat.txt"))
+log_file <- file.path(log_dir, paste0("wrapper_stage_00_", group_dir, "_", timestamp_tag, ".log"))
+hb_file  <- file.path(log_dir, paste0("wrapper_stage_00_", group_dir, "_heartbeat.txt"))
 
 log_line <- function(...) {
   msg <- paste0(...)
