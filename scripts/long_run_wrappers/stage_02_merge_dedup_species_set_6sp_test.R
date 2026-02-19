@@ -1,0 +1,141 @@
+# scripts/stage_02_merge_dedup_species_set_6sp_test.R ----------------------------------
+# Stage 02: merge and safe 1-to-1 day duplicate auto-drop for a test species set
+#
+# Purpose:
+#   Run the Stage 02 merge step for a small species list, producing per-species merged
+#   outputs and a run log.
+#
+# Outputs:
+#   data/processed/02_merged/<slug>/occ_<slug>__merged.(parquet|rds)
+#   data/processed/02_merged/_runlog_02_merged.csv
+#
+# Behaviour:
+#   - Reads raw-clean CSVs from data/raw/gbif and data/raw/nbn (created by pull_raw_occurrences()
+#     and, where relevant, the Stage 1.5 NBN top-up/repair clean rewrites).
+#   - Merges GBIF + NBN for each species and retains all original columns.
+#   - Adds derived fields used downstream (IDs, parsed day, rounded coordinates, keys).
+#   - Drops only the most conservative cross-source duplicates:
+#       * exactly 1 GBIF + 1 NBN record share the same rounded coordinates and true day-level date
+#       * the non-preferred source record is dropped (prefer_source)
+#   - If only one source is available for a species, the merge still runs and writes output.
+#
+# Notes:
+#   - Raw inputs may be grouped (data/raw/<src>/<group>/...) or ungrouped (data/raw/<src>/...).
+#     This script can be used with either layout by setting group_dir appropriately.
+#   - When GBIF downloads are still pending, some species may only have NBN inputs available.
+#     Re-running later will incorporate new GBIF files if refresh_if_inputs_newer=TRUE.
+
+
+# ---- Find repo root (works from any scripts/ subfolder) ----
+this_file <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
+if (is.null(this_file) || !nzchar(this_file)) {
+  stop(
+    "Can't determine script path (sys.frame(1)$ofile is NULL). ",
+    "Run via source('.../scripts/.../stage_02_merge_dedup_species_set_6sp_test.R') from a file, not copy/paste."
+  )
+}
+
+script_dir <- dirname(normalizePath(this_file, winslash = "/", mustWork = TRUE))
+
+find_repo_root <- function(start_dir) {
+  markers <- c(".git", "R", "data", "InfluentialSpecies.Rproj", "DESCRIPTION")
+  d <- start_dir
+  for (i in 1:15) {
+    if (any(file.exists(file.path(d, markers)))) return(d)
+    parent <- dirname(d)
+    if (identical(parent, d)) break
+    d <- parent
+  }
+  stop("Couldn't find repo root walking up from: ", start_dir)
+}
+
+repo_root <- find_repo_root(script_dir)
+
+# ---- Load the workflow function ----
+# Canonical Stage 02 engine lives under scripts/long_run_wrappers/.
+merge_fn <- file.path(repo_root, "scripts", "long_run_wrappers", "merge_dedup_species_set_6sp_test.R")
+if (!file.exists(merge_fn)) {
+  stop(
+    "Can't find Stage 02 merge engine at: ", merge_fn,
+    "\nCheck that the file exists at InfluentialSpecies/scripts/long_run_wrappers/merge_dedup_species_set_6sp_test.R"
+  )
+}
+source(merge_fn)
+
+# ---- Key settings ----
+# If you used a grouped pull, set e.g. "set_6sp_test".
+# If you wrote straight into data/raw/gbif and data/raw/nbn, set group_dir <- "".
+group_dir <- ""   # <-- your current setup
+
+species_names <- c(
+  "Myrmica sabuleti",
+  "Myrmica scabrinodis",
+  "Andrena fulva",
+  "Sorex araneus",
+  "Leptothorax acervorum",
+  "Emberiza schoeniclus"
+)
+
+# Conservative duplicate rule settings
+coord_round_dp <- 4
+prefer_source  <- "GBIF"
+
+# Optional: while GBIF downloads are pending, you can choose to only merge species
+# that have at least one raw input present. (merge_occurrences() also handles missing
+# inputs gracefully, so this is just a convenience.)
+only_merge_if_any_input_exists <- TRUE
+
+# ---- Helper: slugify + raw input discovery (matches Stage 02 engine) ----
+slugify_species <- function(species_name) {
+  slug <- gsub("[^a-z0-9]+", "_", tolower(species_name))
+  slug <- gsub("^_+|_+$", "", slug)
+  slug
+}
+
+normalise_group_dir <- function(x) {
+  if (is.null(x) || length(x) == 0 || is.na(x) || !nzchar(x)) "" else x
+}
+
+find_raw_clean_csv <- function(repo_root, raw_dir, source, group_dir, slug) {
+  src <- tolower(source)
+  fname <- paste0(src, "_", slug, "_clean.csv")
+  group_dir <- normalise_group_dir(group_dir)
+  
+  candidates <- c(
+    file.path(raw_dir, src, group_dir, slug, fname),
+    file.path(raw_dir, src, group_dir, fname),
+    file.path(raw_dir, src, slug, fname),
+    file.path(raw_dir, src, fname)
+  )
+  
+  hit <- candidates[file.exists(candidates)]
+  if (length(hit) == 0) return(NA_character_)
+  hit[1]
+}
+
+if (isTRUE(only_merge_if_any_input_exists)) {
+  raw_dir <- file.path(repo_root, "data", "raw")
+  keep <- vapply(species_names, function(sp) {
+    slug <- slugify_species(sp)
+    gbif <- find_raw_clean_csv(repo_root, raw_dir, "gbif", group_dir, slug)
+    nbn  <- find_raw_clean_csv(repo_root, raw_dir, "nbn",  group_dir, slug)
+    (!is.na(gbif) && file.exists(gbif)) || (!is.na(nbn) && file.exists(nbn))
+  }, logical(1))
+  
+  dropped <- species_names[!keep]
+  if (length(dropped) > 0) {
+    message("Skipping species with no raw inputs present: ", paste(dropped, collapse = ", "))
+  }
+  species_names <- species_names[keep]
+}
+
+# ---- Run ----
+merge_occurrences(
+  species_names           = species_names,
+  group_dir               = group_dir,
+  coord_round_dp          = coord_round_dp,
+  prefer_source           = prefer_source,
+  overwrite               = TRUE,  # runs slower, but important if raw pulls are updated (harder force than below argument)
+  refresh_if_inputs_newer = TRUE,  # key: re-run later to pick up newly arrived GBIF downloads
+  continue_on_error       = TRUE
+)
