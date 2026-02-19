@@ -571,13 +571,22 @@ merge_occurrences <- function(species_names,
       n_day_nbn = if (!is.null(res$nbn_prec)) res$nbn_prec[["day"]] else NA_integer_,
       n_year_nbn = if (!is.null(res$nbn_prec)) res$nbn_prec[["year"]] else NA_integer_,
       n_unknown_nbn = if (!is.null(res$nbn_prec)) res$nbn_prec[["unknown"]] else NA_integer_,
-      out_file = res$out_file,
-      status = res$status,
-      note = res$note
+      out_file = res$out_file %||% NA_character_,
+      status = res$status %||% NA_character_,
+      note = res$note %||% NA_character_
     )
     
-    message("[02_merged] ", sp, " -> ", res$status,
-            if (!is.null(res$n_final)) paste0(" | final=", res$n_final) else "")
+    # Write runlog incrementally so a crash doesn't leave a stale log behind.
+    # This is best-effort only; failures here should not stop the main merge loop.
+    tryCatch(
+      readr::write_csv(run_log, runlog_path),
+      error = function(e) invisible(NULL)
+    )
+    
+    message(
+      "[02_merged] ", sp, " -> ", (res$status %||% "UNKNOWN"),
+      if (!is.null(res$n_final)) paste0(" | final=", res$n_final) else ""
+    )
   }
   
   readr::write_csv(run_log, runlog_path)

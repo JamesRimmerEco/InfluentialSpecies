@@ -70,7 +70,7 @@ coord_round_dp <- 4
 prefer_source  <- "GBIF"
 
 # Long-run behaviour
-overwrite               <- TRUE   # set FALSE once you're confident; TRUE forces rebuild
+overwrite               <- FALSE   # set FALSE once you're confident; TRUE forces rebuild
 refresh_if_inputs_newer <- TRUE   # pick up new/updated raw clean CSVs
 continue_on_error       <- TRUE
 
