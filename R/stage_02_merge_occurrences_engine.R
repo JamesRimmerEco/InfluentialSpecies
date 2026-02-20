@@ -454,6 +454,13 @@ merge_occurrences <- function(species_names,
       gbif <- read_csv_if_exists(gbif_file)
       nbn  <- read_csv_if_exists(nbn_file)
       
+      # A clean CSV can exist but still be empty (0 rows), especially for NBN (UK-only)
+      # when a species has no UK occurrences. Treat 0-row inputs as "no input" to avoid
+      # type-instability when binding empty tibbles.
+      if (!is.null(gbif) && nrow(gbif) == 0) gbif <- NULL
+      if (!is.null(nbn)  && nrow(nbn)  == 0) nbn  <- NULL
+      
+      
       note <- ""
       
       if (is.null(gbif) && is.null(nbn)) {
