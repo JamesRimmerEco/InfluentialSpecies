@@ -1,18 +1,20 @@
-# InfluentialSpecies - Stage 02: QC flagging of merged occurrences ----------------
+# qc_flag_occurrences.R
+#
+# InfluentialSpecies - Stage 03: QC flagging of merged occurrences ----------------
 #
 # Outputs:
-#   data/processed/02_qc_flagged/<slug>/occ_<slug>__qc_flagged.(parquet|rds)
-#   data/processed/02_qc_flagged/_runlog_02_qc_flagged.csv
+#   data/processed/03_qc_flagged/<slug>/occ_<slug>__qc_flagged.(parquet|rds)
+#   data/processed/03_qc_flagged/_runlog_03_qc_flagged.csv
 #
 # Behaviour:
-#   - Reads Stage 01 merged per-species outputs (parquet or rds).
+#   - Reads Stage 02 merged per-species outputs (parquet or rds).
 #   - Adds a set of QC flag columns to support later filtering and diagnostics.
 #   - Does not drop records at this stage; it only annotates them.
 #
 # Notes:
-#   - Stage 01 inputs may exist in more than one layout (grouped/ungrouped).
+#   - Stage 02 inputs may exist in more than one layout (grouped/ungrouped).
 #     This script searches a small set of sensible candidate paths and uses the first hit.
-#   - Stage 02 outputs are always written ungrouped under data/processed/02_qc_flagged/<slug>/.
+#   - Stage 03 outputs are always written ungrouped under data/processed/03_qc_flagged/<slug>/.
 #   - Flag rules are intentionally conservative and easy to change. Adjust thresholds and
 #     the flag definitions in one place (the "QC rules" section inside qc_flag_occurrences()).
 
@@ -47,11 +49,11 @@ normalise_group_dir <- function(x) {
   if (is.null(x) || length(x) == 0 || is.na(x) || !nzchar(x)) "" else x
 }
 
-# ---- Helper: locate Stage 01 merged input (supports grouped/ungrouped) -------
+# ---- Helper: locate Stage 02 merged input (supports grouped/ungrouped) -------
 # Candidate layouts:
-#   grouped    : data/processed/01_merged/<group>/<slug>/occ_<slug>__merged.(parquet|rds)
-#   ungrouped  : data/processed/01_merged/<slug>/occ_<slug>__merged.(parquet|rds)
-find_stage01_merged <- function(repo_root, in_root, group_dir, slug) {
+#   grouped    : data/processed/02_merged/<group>/<slug>/occ_<slug>__merged.(parquet|rds)
+#   ungrouped  : data/processed/02_merged/<slug>/occ_<slug>__merged.(parquet|rds)
+find_stage02_merged <- function(repo_root, in_root, group_dir, slug) {
   group_dir <- normalise_group_dir(group_dir)
   base_name <- paste0("occ_", slug, "__merged")
   
@@ -80,7 +82,7 @@ find_stage01_merged <- function(repo_root, in_root, group_dir, slug) {
 }
 
 # ---- Helper: read parquet or rds --------------------------------------------
-read_stage01_merged <- function(base_path_no_ext) {
+read_stage02_merged <- function(base_path_no_ext) {
   if (is.na(base_path_no_ext) || !nzchar(base_path_no_ext)) return(NULL)
   
   p_parq <- paste0(base_path_no_ext, ".parquet")
@@ -128,8 +130,8 @@ existing_output_path <- function(out_base_no_ext) {
 # ---- Main function -----------------------------------------------------------
 qc_flag_occurrences <- function(species_names,
                                 group_dir = "",
-                                in_root  = file.path("data", "processed", "01_merged"),
-                                out_root = file.path("data", "processed", "02_qc_flagged"),
+                                in_root  = file.path("data", "processed", "02_merged"),
+                                out_root = file.path("data", "processed", "03_qc_flagged"),
                                 overwrite = FALSE,
                                 refresh_if_inputs_newer = TRUE,
                                 continue_on_error = TRUE,
@@ -141,7 +143,7 @@ qc_flag_occurrences <- function(species_names,
   repo_root <- get_repo_root()
   group_dir <- normalise_group_dir(group_dir)
   
-  # Stage 02 output convention: ungrouped under 02_qc_flagged/<slug>/.
+  # Stage 03 output convention: ungrouped under 03_qc_flagged/<slug>/.
   out_dir <- file.path(repo_root, out_root)
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
   
@@ -165,7 +167,7 @@ qc_flag_occurrences <- function(species_names,
     note = character()
   )
   
-  runlog_path <- file.path(out_dir, "_runlog_02_qc_flagged.csv")
+  runlog_path <- file.path(out_dir, "_runlog_03_qc_flagged.csv")
   on.exit({
     try(readr::write_csv(run_log, runlog_path), silent = TRUE)
   }, add = TRUE)
@@ -173,7 +175,7 @@ qc_flag_occurrences <- function(species_names,
   for (sp in species_names) {
     slug <- slugify_species(sp)
     
-    in_base <- find_stage01_merged(repo_root, in_root, group_dir, slug)
+    in_base <- find_stage02_merged(repo_root, in_root, group_dir, slug)
     in_parq <- if (!is.na(in_base)) paste0(in_base, ".parquet") else NA_character_
     in_rds  <- if (!is.na(in_base)) paste0(in_base, ".rds") else NA_character_
     in_file <- if (!is.na(in_base) && file.exists(in_parq)) in_parq else if (!is.na(in_base) && file.exists(in_rds)) in_rds else NA_character_
@@ -210,9 +212,9 @@ qc_flag_occurrences <- function(species_names,
             n_flag_has_issues = NA_integer_,
             out_file = out_existing,
             status = "skipped_cached",
-            note = "QC output exists and Stage 01 input is not newer (overwrite=FALSE)."
+            note = "QC output exists and Stage 02 input is not newer (overwrite=FALSE)."
           )
-          message("[02_qc_flagged] ", sp, " -> skipped_cached")
+          message("[03_qc_flagged] ", sp, " -> skipped_cached")
           next
         }
       } else if (!isTRUE(refresh_if_inputs_newer)) {
@@ -236,19 +238,19 @@ qc_flag_occurrences <- function(species_names,
           status = "skipped_cached",
           note = "QC output exists (overwrite=FALSE, refresh_if_inputs_newer=FALSE)."
         )
-        message("[02_qc_flagged] ", sp, " -> skipped_cached")
+        message("[03_qc_flagged] ", sp, " -> skipped_cached")
         next
       }
     }
     
     do_one <- function() {
       if (!in_exists) {
-        return(list(status = "no_input", note = "Stage 01 merged input not found.", out_file = NA_character_))
+        return(list(status = "no_input", note = "Stage 02 merged input not found.", out_file = NA_character_))
       }
       
-      df <- read_stage01_merged(in_base)
+      df <- read_stage02_merged(in_base)
       if (is.null(df)) {
-        return(list(status = "no_input", note = "Stage 01 merged input could not be read.", out_file = NA_character_))
+        return(list(status = "no_input", note = "Stage 02 merged input could not be read.", out_file = NA_character_))
       }
       
       n_in <- nrow(df)
@@ -270,7 +272,7 @@ qc_flag_occurrences <- function(species_names,
       #   qc_flag_any                  : TRUE if any flag is TRUE
       #   qc_flag_count                : number of TRUE flags per record (optional)
       
-      # Pull out columns defensively (Stage 01 always creates lon/lat/year/date_precision/event_day,
+      # Pull out columns defensively (Stage 02 always creates lon/lat/year/date_precision/event_day,
       # but older outputs may contain different types).
       lon <- if ("lon" %in% names(df)) suppressWarnings(as.numeric(df$lon)) else rep(NA_real_, n_in)
       lat <- if ("lat" %in% names(df)) suppressWarnings(as.numeric(df$lat)) else rep(NA_real_, n_in)
@@ -401,7 +403,7 @@ qc_flag_occurrences <- function(species_names,
       note = res$note
     )
     
-    message("[02_qc_flagged] ", sp, " -> ", res$status,
+    message("[03_qc_flagged] ", sp, " -> ", res$status,
             if (!is.null(res$n_in)) paste0(" | n=", res$n_in) else "")
   }
   
