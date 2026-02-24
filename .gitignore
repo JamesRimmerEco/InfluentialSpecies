@@ -66,8 +66,15 @@ data/_meta/**/*.xlsx
 # Stage logs (wrapper / audit / top-up)
 data/_meta/logs/
 
-
-
-
-
-
+# InfluentialSpecies: derived status-table outputs (ignore generated CSVs)
+docs/derived/**
+!docs/derived/**/
+!docs/derived/**/.gitkeep
+# Scratch / write tests
+write-test*
+# Regularisation sweep outputs (if generated / heavy)
+data/_regularisation_sweep/**
+!data/_regularisation_sweep/**/
+!data/_regularisation_sweep/**/.gitkeep
+# Ensure canonical species list is tracked (override meta CSV ignore)
+!data/_meta/species_list_binomial.csv
