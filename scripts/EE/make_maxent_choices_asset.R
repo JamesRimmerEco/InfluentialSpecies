@@ -1,22 +1,22 @@
 #!/usr/bin/env Rscript
 
 # =============================================================================
-# InfluentialSpecies — Stage 05 — MaxEnt parameter-choice asset builder (R)
+# InfluentialSpecies — Stage 06 — MaxEnt parameter-choice asset builder (R)
 # Script: make_maxent_choices_asset.R
 #
 # What this script is for
 # -----------------------
-# Given a Stage 05 regularisation/feature sweep metrics CSV exported from Earth Engine,
-# choose an "optimal" MaxEnt parameterisation per species using a clear, repeatable rule,
-# then write a small CSV suitable for manual upload to Earth Engine as a FeatureCollection
-# asset.
+# Given a Stage 06 regularisation/feature sweep metrics CSV exported from Earth Engine,
+# choose an MaxEnt parameterisation per species using a clear, repeatable rule,
+# then write a small CSV suitable for manual upload to Earth Engine as a
+# FeatureCollection asset.
 #
 # This is the direct analogue of make_band_choices_asset.R, but for:
 #   - betaMultiplier (regularisation strength)
 #   - featurePreset  (feature-class preset; e.g. AUTO, LQ, LQH)
 #
 # In addition to producing the small “choices CSV”, this script prints a ranked
-# per-species summary to the console so you can see how each model performed:
+# per-species summary to the console so you can see how each configuration performed:
 #   - mean CV AUC
 #   - fold-to-fold SD
 #   - worst-fold AUC (minimum fold AUC)
@@ -49,31 +49,37 @@
 #   - one row per species
 #   - includes chosen_betaMultiplier + chosen_featurePreset (+ feature flags)
 #
-# Decision rule (robust + scalable)
-# ---------------------------------
-# We want two things at once:
-#   1) strong spatial generalisation (high mean CV AUC)
-#   2) avoid unnecessary complexity (prefer simpler MaxEnt settings) unless
-#      higher complexity is clearly beneficial.
+# Selection rule (stable + reportable)
+# ------------------------------------
+# 1) Summarise spatial CV AUC by configuration (betaMultiplier × featurePreset):
+#      - cv_mean_auc : mean AUC across folds
+#      - cv_sd_auc   : SD of AUC across folds (lower is more consistent)
+#      - cv_min_auc  : worst-fold AUC (minimum across folds)
+#      - cv_n_folds  : number of folds observed with valid AUC
 #
-# The rule is therefore:
-#   A) Compute mean CV AUC per configuration (betaMultiplier × featurePreset).
-#   B) Find the best mean CV AUC and its fold-to-fold variability (CV SD).
-#   C) Define an "acceptable performance window" around the best using an
-#      adaptive delta:
-#         delta = clamp(SD_MULT * best_cv_sd, DELTA_MIN, DELTA_MAX)
-#   D) Among configurations within that window, prefer stability (SD not much worse
-#      than best).
-#   E) Among stable candidates within the window, prefer *simplicity*:
-#        - higher betaMultiplier (stronger regularisation) is simpler/smoother
-#        - featurePreset ranked simplest-to-most-flexible (configurable below)
+# 2) Guard against broken outputs before choosing:
+#      - AUC values must be finite
+#      - at least MIN_KFOLDS_OBS folds observed
+#      - worst-fold AUC must be >= MIN_CV_AUC_FLOOR
+#      - optional: enforce a minimum betaMultiplier (MIN_BETA_ALLOWED)
 #
-# Sanity guards
-# -------------
-# To avoid selecting from broken outputs, we require:
-#   - finite AUC values
-#   - at least MIN_KFOLDS_OBS folds with valid AUC
-#   - minimum fold AUC above MIN_CV_AUC_FLOOR
+# 3) Define a near-best performance window around the best mean CV AUC:
+#      - best_mean = max(cv_mean_auc)
+#      - best_sd   = SD of the best-mean configuration
+#      - delta     = clamp(SD_MULT * best_sd, DELTA_MIN, DELTA_MAX)
+#      - keep configurations with cv_mean_auc >= (best_mean - delta)
+#
+# 4) Within the near-best window, keep configurations that are not much less
+#    consistent than the best:
+#      - keep if cv_sd_auc <= best_sd * (1 + SD_REL_TOL)
+#
+# 5) Choose a single configuration using the following priority:
+#      A) consistency across folds: minimise cv_sd_auc
+#      B) avoid weak spatial blocks: maximise cv_min_auc
+#      C) overall performance: maximise cv_mean_auc
+#      D) simplicity as a final tie-break:
+#           - higher betaMultiplier (stronger regularisation) is preferred
+#           - featurePreset ranked simplest-to-most-flexible (configurable below)
 #
 # Holdout AUC is recorded for audit, but not used as the tuning signal.
 # =============================================================================
@@ -98,21 +104,21 @@ INFILE <- file.path(
 # Output choices table (upload this CSV to EE as a FeatureCollection asset)
 OUTFILE <- file.path(
   REPO_ROOT, "data", "_regularisation_sweep",
-  "stage05_maxent_choices_asset_v01.csv"
+  "stage06_maxent_choices_asset_v01.csv"
 )
 
-# --- Performance window around the best (adaptive delta) ----------------------
+# --- Near-best performance window around the best (adaptive delta) ------------
 
 # delta = clamp(SD_MULT * best_cv_sd, DELTA_MIN, DELTA_MAX)
 SD_MULT   <- 0.50
 DELTA_MIN <- 0.003
 DELTA_MAX <- 0.010
 
-# --- Stability preference -----------------------------------------------------
+# --- Consistency tolerance ----------------------------------------------------
 
-# Among candidates within delta, prefer those whose CV SD is not much worse
-# than the best model’s CV SD.
-SD_REL_TOL <- 0.25  # allow up to +25% higher CV SD than best
+# Within the near-best window, keep configurations whose CV SD is not much worse
+# than the best-mean configuration’s CV SD.
+SD_REL_TOL <- 0.25  # allow up to +25% higher CV SD than the best
 
 # --- Sanity guards ------------------------------------------------------------
 
@@ -121,10 +127,10 @@ MIN_CV_AUC_FLOOR <- 0.60
 
 # --- Simplicity ordering ------------------------------------------------------
 #
-# This is used only *after* filtering to the near-best performance window.
+# Used only as a final tie-break after consistency and worst-fold performance.
 #
 # Interpretation:
-# - Higher betaMultiplier => stronger regularisation => smoother/simpler model.
+# - Higher betaMultiplier => stronger regularisation => smoother model.
 # - Feature presets are ranked by expected flexibility (lower rank = simpler).
 #
 # Adjust this map to match the names you used in the EE sweep.
@@ -201,10 +207,11 @@ maybe_constant <- function(df, col) {
 
 rule_string <- function() {
   paste0(
-    "adaptive_delta=clamp(", SD_MULT, "*best_cv_sd,",
-    DELTA_MIN, ",", DELTA_MAX, "); ",
-    "prefer_sd<=(1+", SD_REL_TOL, ")*best_sd; ",
-    "prefer_simpler=(higher_beta,lower_feature_rank); ",
+    "near_best_window=mean>=best-delta; ",
+    "delta=clamp(", SD_MULT, "*best_sd,", DELTA_MIN, ",", DELTA_MAX, "); ",
+    "keep_sd<=(", 1 + SD_REL_TOL, ")*best_sd; ",
+    "choose_by=(min_sd,max_minfold,max_mean,then_simpler); ",
+    "simpler=(higher_beta,lower_feature_rank); ",
     "require_folds>=", MIN_KFOLDS_OBS, "; ",
     "cv_min>=", MIN_CV_AUC_FLOOR,
     if (!is.na(MIN_BETA_ALLOWED)) paste0("; min_beta=", MIN_BETA_ALLOWED) else ""
@@ -269,9 +276,11 @@ choose_config <- function(sp_stats) {
   
   if (nrow(stable) == 0) {
     cand <- cand[order(
-      -cand$betaMultiplier,     # prefer higher beta (simpler)
-      cand$feature_rank,        # prefer simpler preset
-      -cand$cv_mean_auc         # then prefer higher performance
+      cand$cv_sd_auc,           # prefer lower SD (more consistent)
+      -cand$cv_min_auc,         # prefer higher worst-fold
+      -cand$cv_mean_auc,        # then prefer higher mean performance
+      -cand$betaMultiplier,     # then prefer higher beta (smoother)
+      cand$feature_rank         # then prefer simpler preset
     ), , drop = FALSE]
     
     return(list(
@@ -283,9 +292,11 @@ choose_config <- function(sp_stats) {
   }
   
   stable <- stable[order(
-    -stable$betaMultiplier,     # prefer higher beta (simpler)
-    stable$feature_rank,        # prefer simpler preset
-    -stable$cv_mean_auc         # then prefer higher performance
+    stable$cv_sd_auc,           # prefer lower SD (more consistent)
+    -stable$cv_min_auc,         # prefer higher worst-fold
+    -stable$cv_mean_auc,        # then prefer higher mean performance
+    -stable$betaMultiplier,     # then prefer higher beta (smoother)
+    stable$feature_rank         # then prefer simpler preset
   ), , drop = FALSE]
   
   list(
@@ -313,7 +324,7 @@ print_ranked_summary <- function(sp, sp_stats, chosen_beta = NA_real_, chosen_pr
   
   cat("\n")
   cat("============================================================\n")
-  cat("Stage 05 MaxEnt sweep summary (ranked): ", sp, "\n", sep = "")
+  cat("Stage 06 MaxEnt sweep summary (ranked): ", sp, "\n", sep = "")
   cat("Ranked by: CV mean (desc), CV worst-fold/min (desc), CV SD (asc)\n")
   cat("------------------------------------------------------------\n")
   
@@ -599,7 +610,7 @@ tryCatch(
   error = function(e) stop("Failed to write output CSV: ", conditionMessage(e), call. = FALSE)
 )
 
-cat("\nStage 05 MaxEnt choices written:\n  ", OUTFILE, "\n", sep = "")
+cat("\nStage 06 MaxEnt choices written:\n  ", OUTFILE, "\n", sep = "")
 cat("Rows (species): ", nrow(out), "\n", sep = "")
 cat("Chosen config by species:\n")
 for (i in seq_len(nrow(out))) {
