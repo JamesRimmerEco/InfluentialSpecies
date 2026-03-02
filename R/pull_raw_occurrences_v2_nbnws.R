@@ -1266,8 +1266,14 @@ pull_nbn_clean <- function(species_name,
   
   # NBN completion state (small, avoids the "empty CSV looks done forever" problem)
   nbn_state_file <- file.path(nbn_ckpt_dir, paste0("nbn_state_", slug, ".rds"))
-  nbn_state <- list(complete = FALSE, last_updated = NA_character_, note = NA_character_, last_error = NA_character_,
-                    totalRecords = NA_integer_, guid = NA_character_)
+  nbn_state <- list(
+    complete = FALSE,
+    last_updated = NA_character_,
+    note = NA_character_,
+    last_error = NA_character_,
+    totalRecords = NA_integer_,
+    guid = NA_character_
+  )
   if (file.exists(nbn_state_file)) {
     tmp <- tryCatch(readRDS(nbn_state_file), error = function(e) NULL)
     if (!is.null(tmp) && is.list(tmp)) nbn_state <- utils::modifyList(nbn_state, tmp)
@@ -1298,8 +1304,9 @@ pull_nbn_clean <- function(species_name,
   # as a list), which can trigger a deterministic parsing error inside galah.
   #
   # When this happens we:
-  #   1) resolve the taxon GUID ourselves via species-ws; then
-  #   2) pull occurrences via records-ws, bypassing galah’s taxonomy parser.
+  #   1) resolve one or more taxon GUIDs via species-ws (trying the project name + aliases);
+  #   2) pull occurrences via records-ws for *each* resolved GUID (one GUID per accepted/synonym concept);
+  #   3) bind and de-duplicate on recordID (stable downstream key).
   #
   # This keeps output folders, filenames, and schemas unchanged.
   
@@ -1354,7 +1361,7 @@ pull_nbn_clean <- function(species_name,
         occ_n = suppressWarnings(as.integer(occurrenceCount))
       )
     
-    # First choice: exact binomial, species-rank, accepted.
+    # First choice: exact binomial, species-rank, accepted (then highest occurrenceCount).
     hit <- res2 %>%
       filter(
         !is.na(scientificName2),
@@ -1373,13 +1380,22 @@ pull_nbn_clean <- function(species_name,
   }
   
   nbn_build_query <- function(params) {
-    paste(
-      paste0(
-        names(params), "=",
-        vapply(params, function(x) utils::URLencode(as.character(x), reserved = TRUE), character(1))
-      ),
-      collapse = "&"
-    )
+    # Build a query string from a list, allowing multiple fq values.
+    parts <- character(0)
+    for (nm in names(params)) {
+      v <- params[[nm]]
+      if (is.null(v)) next
+      if (length(v) == 0) next
+      
+      if (nm == "fq" && length(v) > 1) {
+        for (vv in v) {
+          parts <- c(parts, paste0("fq=", utils::URLencode(vv, reserved = TRUE)))
+        }
+      } else {
+        parts <- c(parts, paste0(nm, "=", utils::URLencode(as.character(v[1]), reserved = TRUE)))
+      }
+    }
+    paste(parts, collapse = "&")
   }
   
   nbn_is_zip_file <- function(path) {
@@ -1478,34 +1494,77 @@ pull_nbn_clean <- function(species_name,
       unname(map[hit_l[1]])
     }
     
-    col_record <- pick_col(c("recordID", "recordId", "record_uuid", "uuid", "id"))
-    col_sci    <- pick_col(c("scientificName", "scientific_name", "taxon_name", "species"))
-    col_date   <- pick_col(c("eventDate", "event_date", "eventdate", "date", "occurrence_date"))
-    col_year   <- pick_col(c("year", "eventYear"))
-    col_lat    <- pick_col(c("decimalLatitude", "decimal_latitude", "latitude", "lat"))
-    col_lon    <- pick_col(c("decimalLongitude", "decimal_longitude", "longitude", "lon", "lng"))
-    col_lic    <- pick_col(c("license", "licence", "dcterms:license", "dcterms.license"))
+    col_record <- pick_col(c(
+      "recordID", "recordId", "record_uuid", "uuid", "id",
+      "NBN Atlas record ID", "Occurrence ID"
+    ))
     
-    col_cuim   <- pick_col(c("coordinateUncertaintyInMeters", "coordinate_uncertainty_in_meters", "coord_uncertainty_m"))
-    col_cp     <- pick_col(c("coordinatePrecision", "coordinate_precision"))
-    col_iv     <- pick_col(c("identificationVerificationStatus", "identification_verification_status", "verificationstatus", "verification_status"))
-    col_idby   <- pick_col(c("identifiedBy", "identified_by"))
+    col_sci <- pick_col(c(
+      "scientificName", "scientific_name", "taxon_name", "species",
+      "Scientific name"
+    ))
     
-    # Some records-ws exports include a point field like "lat,lon" (e.g. point-1km / point-100m).
-    col_point  <- pick_col(c("point00001", "point0001", "point001", "point01", "point1", "point", "point_1km", "point_100m", "point_10m"))
-    col_grid   <- pick_col(c("gridReference", "grid_reference", "grid_ref"))
+    col_date <- pick_col(c(
+      "eventDate", "event_date", "eventdate", "date", "occurrence_date",
+      "Event Date"
+    ))
     
-    # Provenance-ish fields (often absent from NBN downloads; we keep them for schema alignment)
-    col_basis  <- pick_col(c("basisOfRecord", "basis_of_record"))
-    col_rank   <- pick_col(c("taxonRank", "taxon_rank", "rank"))
-    col_occst  <- pick_col(c("occurrenceStatus", "occurrence_status"))
-    col_dk     <- pick_col(c("datasetKey", "dataset_key"))
-    col_dn     <- pick_col(c("datasetName", "dataset_name"))
-    col_pok    <- pick_col(c("publishingOrgKey", "publishing_org_key"))
-    col_inst   <- pick_col(c("institutionCode", "institution_code"))
-    col_coll   <- pick_col(c("collectionCode", "collection_code"))
+    col_year <- pick_col(c(
+      "year", "eventYear",
+      "Year"
+    ))
     
-    # Base extraction
+    col_lat <- pick_col(c(
+      "decimalLatitude", "decimal_latitude", "latitude", "lat",
+      "Latitude (WGS84)"
+    ))
+    
+    col_lon <- pick_col(c(
+      "decimalLongitude", "decimal_longitude", "longitude", "lon", "lng",
+      "Longitude (WGS84)"
+    ))
+    
+    col_lic <- pick_col(c(
+      "license", "licence", "dcterms:license", "dcterms.license",
+      "Licence"
+    ))
+    
+    col_cuim <- pick_col(c(
+      "coordinateUncertaintyInMeters", "coordinate_uncertainty_in_meters", "coord_uncertainty_m"
+    ))
+    
+    col_cp <- pick_col(c(
+      "coordinatePrecision", "coordinate_precision"
+    ))
+    
+    col_iv <- pick_col(c(
+      "identificationVerificationStatus", "identification_verification_status",
+      "verificationstatus", "verification_status"
+    ))
+    
+    col_idby <- pick_col(c(
+      "identifiedBy", "identified_by"
+    ))
+    
+    col_point <- pick_col(c(
+      "point00001", "point0001", "point001", "point01", "point1",
+      "point", "point_1km", "point_100m", "point_10m"
+    ))
+    
+    col_grid <- pick_col(c(
+      "gridReference", "grid_reference", "grid_ref",
+      "Grid reference"
+    ))
+    
+    col_basis <- pick_col(c("basisOfRecord", "basis_of_record"))
+    col_rank  <- pick_col(c("taxonRank", "taxon_rank", "rank", "Taxon Rank"))
+    col_occst <- pick_col(c("occurrenceStatus", "occurrence_status", "Occurrence status"))
+    col_dk    <- pick_col(c("datasetKey", "dataset_key"))
+    col_dn    <- pick_col(c("datasetName", "dataset_name"))
+    col_pok   <- pick_col(c("publishingOrgKey", "publishing_org_key"))
+    col_inst  <- pick_col(c("institutionCode", "institution_code"))
+    col_coll  <- pick_col(c("collectionCode", "collection_code"))
+    
     recordID <- if (!is.null(col_record)) as.character(df[[col_record]]) else NA_character_
     scientificName <- if (!is.null(col_sci)) as.character(df[[col_sci]]) else species_name
     eventDate <- if (!is.null(col_date)) as.character(df[[col_date]]) else NA_character_
@@ -1576,13 +1635,68 @@ pull_nbn_clean <- function(species_name,
       stringsAsFactors = FALSE
     )
     
-    # Keep gridReference in the raw standardisation environment if present (useful for debugging),
-    # but do not rely on it for coordinate conversion at this stage.
     if (!is.null(col_grid) && !"gridReference" %in% names(out)) {
       out$gridReference <- as.character(df[[col_grid]])
     }
     
     out
+  }
+  
+  # If NBN species-ws has a different accepted name than the project list, try a small synonym ladder.
+  # This is strictly a fallback for GUID resolution; outputs still use the project species_name + slug.
+  nbn_alias_map <- list(
+    saxicola_torquata = c("Saxicola rubicola"),
+    tetrao_tetrix = c("Lyrurus tetrix"),
+    clethrionomys_glareolus = c("Myodes glareolus")
+  )
+  
+  nbn_aliases_for <- function(primary_species_name) {
+    sl <- slugify_species(primary_species_name)
+    al <- nbn_alias_map[[sl]]
+    if (is.null(al) || length(al) == 0) character() else as.character(al)
+  }
+  
+  # Candidate names to try for NBN taxonomy + occurrence retrieval.
+  # The output files always use the project species_name (Forestry England name).
+  nbn_candidate_names <- function(primary_species_name) {
+    nm <- unique(c(primary_species_name, nbn_aliases_for(primary_species_name)))
+    nm <- nm[nzchar(nm)]
+    nm
+  }
+  
+  # Resolve *all* GUIDs we can find across candidate names.
+  # Returns a data.frame with columns: query_name, guid.
+  nbn_resolve_guids_species_ws <- function(primary_species_name) {
+    nm_try <- nbn_candidate_names(primary_species_name)
+    
+    out <- list()
+    
+    for (nm in nm_try) {
+      res <- tryCatch(nbn_species_ws_search(nm), error = function(e) NULL)
+      if (is.null(res) || !is.data.frame(res) || nrow(res) == 0) next
+      
+      # Prefer the exact match GUID for that name.
+      guid <- nbn_pick_guid(res, nm)
+      if (!is.na(guid) && nzchar(guid)) {
+        out[[length(out) + 1L]] <- data.frame(
+          query_name = nm,
+          guid = guid,
+          stringsAsFactors = FALSE
+        )
+        next
+      }
+      
+      # If no exact match for that specific spelling, do not guess other names here.
+    }
+    
+    if (length(out) == 0) {
+      return(data.frame(query_name = character(), guid = character(), stringsAsFactors = FALSE))
+    }
+    
+    df <- dplyr::bind_rows(out) %>%
+      distinct(guid, .keep_all = TRUE)
+    
+    df
   }
   
   nbn_records_ws_total <- function(guid) {
@@ -1604,7 +1718,6 @@ pull_nbn_clean <- function(species_name,
     # We set dwcHeaders=true for Darwin Core names and qa=none to avoid the extra assertions file.
     # Note: the NBN occurrence download web service is capped to 500,000 records per download.
     # For very common taxa, this may be a truncated export (flagged later via totalRecords).
-    
     work_root <- file.path(get_checkpoint_root(repo_root), "nbn_work")
     dir.create(work_root, recursive = TRUE, showWarnings = FALSE)
     
@@ -1625,13 +1738,11 @@ pull_nbn_clean <- function(species_name,
     zip_path <- file.path(work_root, paste0("nbn_download_", slug, "_", ts, ".zip"))
     unzip_dir <- file.path(work_root, paste0("nbn_download_", slug, "_", ts, "_unzipped"))
     
-    # Longer downloads are common for large taxa; raise timeout locally around the download call.
     old_timeout <- getOption("timeout")
     options(timeout = max(as.integer(old_timeout), as.integer(nbn_download_timeout_s)))
     on.exit(options(timeout = old_timeout), add = TRUE)
     
     download_one <- function(dest) {
-      # Prefer curl if available (more robust on Windows for large files).
       if (requireNamespace("curl", quietly = TRUE)) {
         res <- tryCatch({
           curl::curl_download(dl_url, destfile = dest, quiet = TRUE, mode = "wb")
@@ -1658,9 +1769,6 @@ pull_nbn_clean <- function(species_name,
       rc
     }
     
-    # Robust download handling:
-    #   - handle timeouts / transient failures with one retry
-    #   - treat non-zero return codes, missing files, or very small files as a failure
     rc <- download_one(zip_path)
     if (!identical(rc, 0L)) {
       unlink(zip_path, force = TRUE)
@@ -1692,8 +1800,6 @@ pull_nbn_clean <- function(species_name,
       return(nbn_standardise_ws_raw(df))
     }
     
-    # Sometimes the endpoint returns CSV directly rather than a zip; handle that too.
-    # However, the endpoint can also return an HTML error page; catch that early rather than parsing garbage.
     snip <- tryCatch(rawToChar(readBin(zip_path, "raw", n = 200)), error = function(e) "")
     if (nzchar(snip) && grepl("<html|service unavailable|request rejected|error", snip, ignore.case = TRUE)) {
       stop("NBN records-ws download returned a non-zip HTML response; treating as a failure.")
@@ -1724,7 +1830,6 @@ pull_nbn_clean <- function(species_name,
       
       occ <- raw$occurrences
       
-      # If the service reports totalRecords but returns no occurrences before we reach it, treat this as an early stop.
       total <- suppressWarnings(as.integer(raw$totalRecords))
       if (is.null(occ) || length(occ) == 0) {
         if (!is.na(total) && isTRUE(total > start)) {
@@ -1857,23 +1962,60 @@ pull_nbn_clean <- function(species_name,
   
   # ---------------------------------------------------------------------------
   # NBN taxon guard
-  #   We proceed only if NBN taxonomy contains an exact, species-rank match.
+  #   Try the project name first, then any configured aliases.
+  #   The pull proceeds via galah only if the taxonomy contains an exact, species-rank match
+  #   for one of the candidate names. If not, we fall back to species-ws + records-ws.
   # ---------------------------------------------------------------------------
   nbn_use_ws <- FALSE
   nbn_guid <- NA_character_
+  name_for_galah <- species_name
+  names_tried <- nbn_candidate_names(species_name)
   
-  nbn_taxa <- tryCatch(search_taxa(species_name), error = function(e) e)
-  
-  if (inherits(nbn_taxa, "error")) {
-    msg <- conditionMessage(nbn_taxa)
-    message(
-      "[NBN] galah taxon lookup failed (will use NBN web services directly).\n",
-      "      Error: ", msg
-    )
-    nbn_use_ws <- TRUE
-  } else {
-    message("NBN taxon search (top hit):")
+  choose_from_taxa <- function(nbn_taxa_df, query_name) {
+    if (!inherits(nbn_taxa_df, "data.frame")) return(list(found = FALSE, guid = NA_character_))
     
+    taxa2 <- nbn_taxa_df
+    
+    if (!"scientific_name" %in% names(taxa2)) {
+      if ("scientificName" %in% names(taxa2)) {
+        taxa2$scientific_name <- taxa2$scientificName
+      } else {
+        taxa2$scientific_name <- NA_character_
+      }
+    }
+    
+    if (!"rank" %in% names(taxa2)) {
+      taxa2$rank <- NA_character_
+    }
+    
+    exact <- taxa2 %>%
+      filter(
+        !is.na(scientific_name),
+        tolower(scientific_name) == tolower(query_name),
+        !is.na(rank),
+        tolower(rank) == "species"
+      )
+    
+    if (nrow(exact) == 0) return(list(found = FALSE, guid = NA_character_))
+    
+    id_col <- intersect(c("taxon_concept_id", "taxonConceptId", "guid"), names(exact))
+    guid <- NA_character_
+    if (length(id_col) > 0) guid <- as.character(exact[[id_col[1]]][1])
+    
+    list(found = TRUE, guid = guid)
+  }
+  
+  last_taxa_err <- NA_character_
+  
+  for (nm in names_tried) {
+    nbn_taxa <- tryCatch(search_taxa(nm), error = function(e) e)
+    
+    if (inherits(nbn_taxa, "error")) {
+      last_taxa_err <- conditionMessage(nbn_taxa)
+      next
+    }
+    
+    message("NBN taxon search (top hit) for '", nm, "':")
     tryCatch(
       {
         ensure_safe_na_print()
@@ -1894,61 +2036,30 @@ pull_nbn_clean <- function(species_name,
       }
     )
     
-    nbn_taxa2 <- nbn_taxa
-    
-    if (inherits(nbn_taxa2, "data.frame")) {
-      
-      if (!"scientific_name" %in% names(nbn_taxa2)) {
-        if ("scientificName" %in% names(nbn_taxa2)) {
-          nbn_taxa2$scientific_name <- nbn_taxa2$scientificName
-        } else {
-          nbn_taxa2$scientific_name <- NA_character_
-        }
-      }
-      
-      if (!"rank" %in% names(nbn_taxa2)) {
-        nbn_taxa2$rank <- NA_character_
-      }
-      
-      nbn_exact <- nbn_taxa2 %>%
-        filter(
-          !is.na(scientific_name),
-          tolower(scientific_name) == tolower(species_name),
-          !is.na(rank),
-          tolower(rank) == "species"
-        )
-      
-      if (nrow(nbn_exact) == 0) {
-        message(
-          "[NBN] No exact species match for '", species_name, "' in NBN taxonomy.\n",
-          "      (Non-UK taxon, synonym/spelling difference, or absent from NBN.)\n",
-          "      Skipping NBN pull and writing an empty output so the pipeline can continue."
-        )
-        
-        nbn_clean <- empty_nbn_clean()
-        readr::write_csv(nbn_clean, nbn_outfile)
-        message("Saved NBN clean file (EMPTY): ", nbn_outfile)
-        
-        nbn_state$complete <- TRUE
-        nbn_state$last_updated <- as.character(Sys.time())
-        nbn_state$note <- "no_exact_species_match"
-        nbn_state$last_error <- NA_character_
-        nbn_state$totalRecords <- 0L
-        safe_saveRDS(nbn_state, nbn_state_file)
-        
-        attr(nbn_clean, "nbn_status") <- list(state = "complete", note = nbn_state$note, totalRecords = nbn_state$totalRecords)
-        return(nbn_clean)
-      }
-      
-      # If the taxonomy table includes a concept ID/guid, keep it for the records-ws fallback.
-      id_col <- intersect(c("taxon_concept_id", "taxonConceptId", "guid"), names(nbn_exact))
-      if (length(id_col) > 0) {
-        nbn_guid <- as.character(nbn_exact[[id_col[1]]][1])
-      }
-      
-    } else {
-      message("[NBN] Taxon table format unexpected; proceeding to attempt pull.")
+    picked <- choose_from_taxa(nbn_taxa, nm)
+    if (isTRUE(picked$found)) {
+      name_for_galah <- nm
+      nbn_guid <- picked$guid
+      break
     }
+  }
+  
+  if (!identical(tolower(name_for_galah), tolower(species_name))) {
+    message("[NBN] Using alias name for NBN pull: ", name_for_galah, " (output stored under: ", species_name, ")")
+  }
+  
+  if (is.na(nbn_guid) && !is.na(last_taxa_err)) {
+    message(
+      "[NBN] galah taxon lookup failed (will use NBN web services directly).\n",
+      "      Error: ", last_taxa_err
+    )
+    nbn_use_ws <- TRUE
+  } else if (is.na(nbn_guid)) {
+    message(
+      "[NBN] No exact species match for '", species_name, "' in galah taxonomy results (including aliases).\n",
+      "      Falling back to species-ws + records-ws for GUID resolution + download."
+    )
+    nbn_use_ws <- TRUE
   }
   
   max_retries <- 5
@@ -1956,6 +2067,7 @@ pull_nbn_clean <- function(species_name,
   
   nbn_raw <- NULL
   last_err <- NA_character_
+  name_used_for_pull <- name_for_galah
   
   # Field sets (avoid known 403 fields: dateIdentified, basisOfRecord, occurrenceStatus)
   nbn_core <- c(
@@ -1977,24 +2089,57 @@ pull_nbn_clean <- function(species_name,
   
   make_select <- function(x) do.call(galah::galah_select, as.list(x))
   
-  if (!isTRUE(nbn_use_ws)) {
-    for (attempt in seq_len(max_retries)) {
-      
-      Sys.sleep(pause_s)
-      
-      nbn_raw_try <- tryCatch(
+  galah_pull_once <- function(nm) {
+    nbn_raw_try <- tryCatch(
+      galah_call() |>
+        galah_identify(nm) |>
+        atlas_occurrences(select = make_select(c(nbn_core, nbn_qa))),
+      error = function(e) e
+    )
+    
+    if (!inherits(nbn_raw_try, "error")) return(nbn_raw_try)
+    
+    msg <- conditionMessage(nbn_raw_try)
+    
+    core_try <- tryCatch(
+      galah_call() |>
+        galah_identify(nm) |>
+        atlas_occurrences(select = make_select(nbn_core)),
+      error = function(e) e
+    )
+    
+    if (!inherits(core_try, "error")) {
+      qa_try <- tryCatch(
         galah_call() |>
-          galah_identify(species_name) |>
-          atlas_occurrences(select = make_select(c(nbn_core, nbn_qa))),
+          galah_identify(nm) |>
+          atlas_occurrences(select = make_select(c("recordID", nbn_qa))),
         error = function(e) e
       )
       
-      if (!inherits(nbn_raw_try, "error")) {
+      if (!inherits(qa_try, "error")) {
+        qa_try <- qa_try %>% distinct(recordID, .keep_all = TRUE)
+        return(core_try %>% left_join(qa_try, by = "recordID"))
+      }
+      
+      return(core_try)
+    }
+    
+    structure(list(error = TRUE, message = msg), class = "nbn_galah_pull_error")
+  }
+  
+  if (!isTRUE(nbn_use_ws)) {
+    for (attempt in seq_len(max_retries)) {
+      Sys.sleep(pause_s)
+      
+      nbn_raw_try <- galah_pull_once(name_for_galah)
+      
+      if (!inherits(nbn_raw_try, "nbn_galah_pull_error")) {
         nbn_raw <- nbn_raw_try
+        name_used_for_pull <- name_for_galah
         break
       }
       
-      last_err <- conditionMessage(nbn_raw_try)
+      last_err <- nbn_raw_try$message
       
       # Deterministic taxonomy parsing bug (non-rectangular taxa response); switch to web services.
       if (grepl("Can't recycle `id`|vctrs::data_frame\\(|synonymComplete", last_err, ignore.case = TRUE)) {
@@ -2007,59 +2152,35 @@ pull_nbn_clean <- function(species_name,
         break
       }
       
+      wait_s <- retry_base_wait_s * attempt
       message(
-        "NBN combined (core+QA) pull failed (attempt ", attempt, "/", max_retries, "): ",
+        "NBN pull failed (attempt ", attempt, "/", max_retries, "): ",
         last_err,
-        "\nTrying fallback: core-only + QA-only join..."
+        " | waiting ", wait_s, "s then retrying..."
       )
-      
-      core_try <- tryCatch(
-        galah_call() |>
-          galah_identify(species_name) |>
-          atlas_occurrences(select = make_select(nbn_core)),
-        error = function(e) e
-      )
-      
-      if (!inherits(core_try, "error")) {
-        
-        qa_try <- tryCatch(
-          galah_call() |>
-            galah_identify(species_name) |>
-            atlas_occurrences(select = make_select(c("recordID", nbn_qa))),
-          error = function(e) e
-        )
-        
-        if (!inherits(qa_try, "error")) {
-          qa_try <- qa_try %>% distinct(recordID, .keep_all = TRUE)
-          nbn_raw <- core_try %>% left_join(qa_try, by = "recordID")
-          break
-        } else {
-          message("Fallback QA-only pull failed: ", conditionMessage(qa_try))
-          nbn_raw <- core_try
-          break
+      Sys.sleep(wait_s)
+    }
+    
+    # If the chosen name pulled 0 rows, try aliases as a last chance before records-ws.
+    if (!isTRUE(nbn_use_ws) && !is.null(nbn_raw) && nrow(nbn_raw) == 0) {
+      alts <- setdiff(nbn_candidate_names(species_name), name_used_for_pull)
+      if (length(alts) > 0) {
+        for (nm in alts) {
+          message("[NBN] Zero rows returned for '", name_used_for_pull, "'. Trying alias name: ", nm)
+          n2 <- tryCatch(galah_pull_once(nm), error = function(e) e)
+          if (!inherits(n2, "nbn_galah_pull_error") && is.data.frame(n2) && nrow(n2) > 0) {
+            nbn_raw <- n2
+            name_used_for_pull <- nm
+            message("[NBN] Alias name returned rows: ", nm, " (output stored under: ", species_name, ")")
+            break
+          }
         }
-        
-      } else {
-        last_err <- conditionMessage(core_try)
-        
-        if (grepl("Can't recycle `id`|vctrs::data_frame\\(|synonymComplete", last_err, ignore.case = TRUE)) {
-          message(
-            "[NBN] galah occurrence pull hit a deterministic taxonomy parsing error.\n",
-            "      Switching to NBN web services for this species.\n",
-            "      Error: ", last_err
-          )
-          nbn_use_ws <- TRUE
-          break
-        }
-        
-        wait_s <- retry_base_wait_s * attempt
-        message(
-          "NBN core pull also failed (attempt ", attempt, "/", max_retries, "): ",
-          last_err,
-          " | waiting ", wait_s, "s then retrying..."
-        )
-        Sys.sleep(wait_s)
       }
+    }
+    
+    # If we still have no object after retries, switch to records-ws.
+    if (is.null(nbn_raw) && !isTRUE(nbn_use_ws)) {
+      nbn_use_ws <- TRUE
     }
   }
   
@@ -2067,70 +2188,115 @@ pull_nbn_clean <- function(species_name,
     
     message("[NBN] Using NBN web services fallback for: ", species_name)
     
-    if (is.na(nbn_guid) || !nzchar(nbn_guid)) {
-      res <- tryCatch(nbn_species_ws_search(species_name), error = function(e) e)
+    # Resolve GUIDs for primary + aliases.
+    resolved <- nbn_resolve_guids_species_ws(species_name)
+    
+    if (!is.data.frame(resolved) || nrow(resolved) == 0) {
       
-      if (inherits(res, "error")) {
-        nbn_state$complete <- FALSE
-        nbn_state$last_updated <- as.character(Sys.time())
-        nbn_state$note <- "taxon_lookup_failed_species_ws"
-        nbn_state$last_error <- conditionMessage(res)
-        safe_saveRDS(nbn_state, nbn_state_file)
-        stop("NBN species-ws lookup failed for: ", species_name, " | ", conditionMessage(res))
-      }
+      message(
+        "[NBN] No exact species-rank match for '", species_name, "' in species-ws (including aliases).\n",
+        "      Skipping NBN pull and writing an empty output so the pipeline can continue."
+      )
       
-      nbn_guid <- nbn_pick_guid(res, species_name)
+      nbn_clean <- empty_nbn_clean()
+      readr::write_csv(nbn_clean, nbn_outfile)
+      message("Saved NBN clean file (EMPTY): ", nbn_outfile)
       
-      if (is.na(nbn_guid) || !nzchar(nbn_guid)) {
-        message(
-          "[NBN] No exact species-rank match for '", species_name, "' in species-ws.\n",
-          "      Skipping NBN pull and writing an empty output so the pipeline can continue."
-        )
-        
-        nbn_clean <- empty_nbn_clean()
-        readr::write_csv(nbn_clean, nbn_outfile)
-        message("Saved NBN clean file (EMPTY): ", nbn_outfile)
-        
-        nbn_state$complete <- TRUE
-        nbn_state$last_updated <- as.character(Sys.time())
-        nbn_state$note <- "no_exact_species_match_species_ws"
-        nbn_state$last_error <- NA_character_
-        nbn_state$totalRecords <- 0L
-        safe_saveRDS(nbn_state, nbn_state_file)
-        
-        attr(nbn_clean, "nbn_status") <- list(state = "complete", note = nbn_state$note, totalRecords = nbn_state$totalRecords)
-        return(nbn_clean)
-      }
+      nbn_state$complete <- TRUE
+      nbn_state$last_updated <- as.character(Sys.time())
+      nbn_state$note <- "no_exact_species_match_species_ws"
+      nbn_state$last_error <- NA_character_
+      nbn_state$totalRecords <- 0L
+      nbn_state$guid <- NA_character_
+      safe_saveRDS(nbn_state, nbn_state_file)
       
-      message("[NBN] species-ws match GUID: ", nbn_guid)
+      attr(nbn_clean, "nbn_status") <- list(state = "complete", note = nbn_state$note, totalRecords = nbn_state$totalRecords)
+      return(nbn_clean)
     }
     
-    # Record totalRecords for QA (also used to flag likely-truncated downloads)
+    # Enrich totals per GUID.
+    resolved$totalRecords <- vapply(resolved$guid, nbn_records_ws_total, integer(1))
+    
+    # Choose a "primary" guid for the state fields (still store all in note).
+    nbn_guid <- as.character(resolved$guid[1])
     nbn_state$guid <- nbn_guid
-    nbn_state$totalRecords <- nbn_records_ws_total(nbn_guid)
-    if (!is.na(nbn_state$totalRecords) && nbn_state$totalRecords > 500000L) {
+    nbn_state$totalRecords <- suppressWarnings(max(resolved$totalRecords, na.rm = TRUE))
+    if (is.infinite(nbn_state$totalRecords)) nbn_state$totalRecords <- NA_integer_
+    
+    used_names <- unique(resolved$query_name)
+    used_guids <- unique(resolved$guid)
+    
+    message("[NBN] species-ws resolved GUIDs (", length(used_guids), "): ", paste(used_guids, collapse = " | "))
+    message("[NBN] query names used: ", paste(used_names, collapse = " | "))
+    
+    any_gt_500k <- any(!is.na(resolved$totalRecords) & resolved$totalRecords > 500000L)
+    if (isTRUE(any_gt_500k)) {
       message(
-        "\n[NBN] NOTE: totalRecords=", nbn_state$totalRecords,
-        " for ", species_name, ". The records-ws download endpoint is capped to 500,000 rows per download.\n",
+        "\n[NBN] NOTE: One or more resolved GUIDs has totalRecords > 500,000 for ", species_name, ".\n",
+        "The records-ws download endpoint is capped to 500,000 rows per download.\n",
         "If you need full coverage for this taxon, it must be retrieved in multiple filtered downloads (e.g. by year ranges).\n"
       )
     }
     
-    # Try bulk download first; if it errors, fall back to paged JSON search.
-    nbn_raw <- tryCatch(nbn_records_ws_download(nbn_guid), error = function(e) e)
+    # Download and bind all GUIDs; if a GUID download errors, try paging for that GUID.
+    all_parts <- list()
+    errs <- character(0)
     
-    if (inherits(nbn_raw, "error")) {
-      message("[NBN] records-ws download failed; trying JSON paging fallback. Error: ", conditionMessage(nbn_raw))
-      nbn_raw <- tryCatch(nbn_records_ws_search_paged(nbn_guid), error = function(e) e)
+    for (k in seq_len(nrow(resolved))) {
+      g <- as.character(resolved$guid[k])
+      nm <- as.character(resolved$query_name[k])
+      tot <- resolved$totalRecords[k]
+      
+      if (!is.na(tot) && tot == 0L) next
+      
+      message("[NBN] records-ws pull for guid=", g, " (name=", nm, ", totalRecords=", tot, ")")
+      
+      part <- tryCatch(nbn_records_ws_download(g), error = function(e) e)
+      if (inherits(part, "error")) {
+        message("[NBN] records-ws download failed for guid=", g, "; trying JSON paging. Error: ", conditionMessage(part))
+        part <- tryCatch(nbn_records_ws_search_paged(g), error = function(e) e)
+      }
+      
+      if (inherits(part, "error")) {
+        errs <- c(errs, paste0(g, ":", conditionMessage(part)))
+        next
+      }
+      
+      if (!is.data.frame(part) || nrow(part) == 0) next
+      
+      part$.nbn_guid_used <- g
+      part$.nbn_name_used <- nm
+      all_parts[[length(all_parts) + 1L]] <- part
     }
     
-    if (inherits(nbn_raw, "error")) {
-      nbn_state$complete <- FALSE
+    if (length(all_parts) == 0) {
+      # No data retrieved for any guid; treat as complete-zero (so audit doesn't keep trying forever).
+      nbn_clean <- empty_nbn_clean()
+      readr::write_csv(nbn_clean, nbn_outfile)
+      message("Saved NBN clean file (EMPTY): ", nbn_outfile)
+      
+      nbn_state$complete <- TRUE
       nbn_state$last_updated <- as.character(Sys.time())
-      nbn_state$note <- "records_ws_failed"
-      nbn_state$last_error <- conditionMessage(nbn_raw)
+      nbn_state$note <- "complete_zero_records_records_ws"
+      if (length(errs) > 0) nbn_state$note <- paste0(nbn_state$note, "|errors:", paste(errs, collapse = "||"))
+      nbn_state$last_error <- if (length(errs) > 0) paste(errs, collapse = " || ") else NA_character_
+      nbn_state$totalRecords <- 0L
+      nbn_state$guid <- nbn_guid
       safe_saveRDS(nbn_state, nbn_state_file)
-      stop("NBN records-ws fallback failed for: ", species_name, " | ", conditionMessage(nbn_raw))
+      
+      attr(nbn_clean, "nbn_status") <- list(state = "complete", note = nbn_state$note, totalRecords = nbn_state$totalRecords, guid = nbn_state$guid)
+      nbn_raw <- nbn_standardise_ws_raw(data.frame())
+    } else {
+      nbn_raw <- dplyr::bind_rows(all_parts)
+      # Keep state info about multi-guid usage (do not change file schema).
+      nbn_state$note <- paste0(
+        "resolved_species_ws_multi_guid|names:",
+        paste(used_names, collapse = ";"),
+        "|guids:",
+        paste(used_guids, collapse = ";")
+      )
+      if (length(errs) > 0) nbn_state$note <- paste0(nbn_state$note, "|errors:", paste(errs, collapse = "||"))
+      name_used_for_pull <- paste(used_names, collapse = " | ")
     }
   }
   
@@ -2221,7 +2387,10 @@ pull_nbn_clean <- function(species_name,
   
   n_before <- nrow(nbn_clean)
   
+  # First de-dup on recordID (stable primary key for downstream).
   nbn_clean <- nbn_clean %>%
+    mutate(recordID = as.character(recordID)) %>%
+    filter(!is.na(recordID) & nzchar(recordID)) %>%
     distinct(recordID, .keep_all = TRUE) %>%
     distinct(lon, lat, date, .keep_all = TRUE)
   
@@ -2240,10 +2409,22 @@ pull_nbn_clean <- function(species_name,
   } else if (nrow(nbn_clean) == 0) {
     nbn_state$note <- "complete_zero_records"
   } else {
-    nbn_state$note <- "complete"
+    if (is.null(nbn_state$note) || is.na(nbn_state$note) || !nzchar(nbn_state$note)) {
+      nbn_state$note <- "complete"
+    } else {
+      nbn_state$note <- paste0("complete|", nbn_state$note)
+    }
   }
   
   if (isTRUE(nbn_use_ws)) nbn_state$note <- paste0(nbn_state$note, "_via_records_ws")
+  
+  if (!is.null(name_used_for_pull) && nzchar(name_used_for_pull)) {
+    if (is.null(nbn_state$note) || is.na(nbn_state$note) || !nzchar(nbn_state$note)) {
+      nbn_state$note <- paste0("pulled_under:", name_used_for_pull)
+    } else {
+      nbn_state$note <- paste0(nbn_state$note, "|pulled_under:", name_used_for_pull)
+    }
+  }
   
   nbn_state$last_error <- NA_character_
   safe_saveRDS(nbn_state, nbn_state_file)
