@@ -65,7 +65,7 @@ source(engine_fn)
 species_csv <- file.path(repo_root, "data", "_meta", "species_list_binomial.csv")
 if (!file.exists(species_csv)) stop("Can't find species list at: ", species_csv)
 
-species_names <- read.csv(species_csv, stringsAsFactors = FALSE, header = TRUE)[[1]]
+species_names <- read.csv(species_csv, stringsAsFactors = FALSE, header = FALSE)[[1]]
 species_names <- as.character(species_names)
 species_names <- trimws(species_names)
 species_names <- species_names[!is.na(species_names) & nzchar(species_names)]
@@ -97,7 +97,7 @@ policy <- list(
   #
   # Sensitive species:
   #   No sensitivity-specific overrides are applied in this run.
-  policy_id = "baseline_2000_unc1km_obs_plus_specimen_prov_gbif__nosensitive",
+  policy_id = "baseline_2000_unc1km_obs_plus_specimen_prov_gbif__nosensitive__nbnAcceptedOnly",
   
   # Keep only selected sources (NULL keeps all).
   keep_sources = NULL,              # e.g. c("GBIF", "NBN")
@@ -137,8 +137,8 @@ policy <- list(
   allowed_taxon_rank = NULL,
   
   # ---- NBN certainty gating (optional; applies if source=="NBN" and column exists)
-  nbn_certainty_col = NULL,
-  nbn_allowed_certainty = NULL,
+  nbn_certainty_col = "identificationVerificationStatus",
+  nbn_allowed_certainty = c("Accepted"),
   
   # ---- Extra rules (advanced) -------------------------------------------------
   # Named list of functions(dt) -> logical drop vector (TRUE means drop).
