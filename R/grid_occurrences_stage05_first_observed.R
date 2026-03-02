@@ -404,12 +404,46 @@ grid_stage04_to_grid <- function(species_names,
         if (!file.exists(runlog_path)) fwrite(row, runlog_path) else fwrite(row, runlog_path, append = TRUE)
       }
       
+      # Backfill summary counts from existing outputs (restart-safe).
+      # The presence points CSV is the modelling-ready product, so it’s the safest
+      # source of truth for gee_points and presence-cell counts without reading the
+      # huge full-grid parquet.
+      n_points_total_bf   <- NA_integer_
+      n_presence_cells_bf <- NA_integer_
+      gee_points_bf       <- NA_integer_
+      
+      if (file.exists(gee_path)) {
+        pts <- tryCatch(fread(gee_path, showProgress = FALSE), error = function(e) NULL)
+        
+        if (!is.null(pts) && nrow(pts) > 0) {
+          gee_points_bf <- as.integer(nrow(pts))
+          
+          # Future-safe: if the points file ever contains >1 point per cell, this still works.
+          if ("cell_id" %in% names(pts)) {
+            n_presence_cells_bf <- as.integer(uniqueN(pts$cell_id))
+          } else {
+            n_presence_cells_bf <- gee_points_bf
+          }
+          
+          # Optional: if available, recover total underlying raw points represented by these cells.
+          if ("n_points_in_cell" %in% names(pts)) {
+            n_points_total_bf <- as.integer(sum(as.integer(pts$n_points_in_cell), na.rm = TRUE))
+          }
+        } else {
+          gee_points_bf       <- 0L
+          n_presence_cells_bf <- 0L
+          n_points_total_bf   <- 0L
+        }
+      }
+      
       summary_dt <- rbind(
         summary_dt,
         data.table(
           species = sp, slug = slug, stage04_file = info$path %||% NA_character_,
           n_read = NA_integer_, n_after_non_na = NA_integer_, n_in_bounds = NA_integer_,
-          n_points_total = NA_integer_, n_presence_cells = NA_integer_, gee_points = NA_integer_,
+          n_points_total = n_points_total_bf,
+          n_presence_cells = n_presence_cells_bf,
+          gee_points = gee_points_bf,
           status = "skipped_exists", note = ""
         )
       )
