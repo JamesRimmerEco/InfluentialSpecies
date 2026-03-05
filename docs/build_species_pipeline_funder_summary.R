@@ -87,7 +87,7 @@ uk_country_values <- c("United Kingdom", "UK", "GB")
 treat_nbn_as_uk   <- TRUE
 
 uncertainty_threshold_m    <- 1000
-uncertainty_missing_action <- "keep"     # "keep" or "drop"
+uncertainty_missing_action <- "drop"     # "keep" or "drop"
 
 grid_policy_tag <- "grid1km_first_observed_landmask_europe_bbox"
 
