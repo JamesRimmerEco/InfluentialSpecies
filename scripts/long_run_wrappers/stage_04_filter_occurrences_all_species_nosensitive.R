@@ -97,7 +97,7 @@ policy <- list(
   #
   # Sensitive species:
   #   No sensitivity-specific overrides are applied in this run.
-  policy_id = "baseline_2000_unc1km_obs_plus_specimen_prov_gbif__nosensitive__nbnAcceptedOnly",
+  policy_id = "baseline_2000_unc1km_dropUncMissing_obs_plus_specimen_prov_gbif__nosensitive__nbnAcceptedOnly",
   
   # Keep only selected sources (NULL keeps all).
   keep_sources = NULL,              # e.g. c("GBIF", "NBN")
@@ -120,7 +120,7 @@ policy <- list(
   
   # ---- Coordinate uncertainty -------------------------------------------------
   max_coord_uncertainty_m = 1000,   # 1 km; set 5000 for 5 km, 10000 for 10 km, etc.
-  uncertainty_missing_action = "keep",
+  uncertainty_missing_action = "drop",
   
   # ---- GBIF issues handling ---------------------------------------------------
   gbif_issues_mode = "ignore",
@@ -224,7 +224,7 @@ out_root <- file.path("data", "processed", "04_filtered")
 # Long-run behaviour:
 #   - overwrite=FALSE is restart-safe (skips species where output exists)
 #   - set TRUE only when you intentionally want to rebuild Stage 04 outputs
-overwrite     <- FALSE
+overwrite     <- TRUE
 
 write_parquet <- TRUE
 write_rds     <- FALSE

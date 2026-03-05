@@ -134,22 +134,18 @@ if (!is.na(limit_n)) species_names <- species_names[seq_len(min(limit_n, length(
 
 processed_root <- file.path(repo_root, "data", "processed")
 
-# Ensure Stage 05 engine resolves in_root/out_stage relative to data/processed
-old_wd <- getwd()
-setwd(processed_root)
-on.exit(setwd(old_wd), add = TRUE)
-
 # Check that stage-04 exists in the place the engine will look
-if (!dir.exists(file.path(processed_root, in_root))) {
+in_root_abs <- file.path(repo_root, "data", "processed", in_root)
+if (!dir.exists(in_root_abs)) {
   stop(
     "Stage 04 input folder not found at: ",
-    file.path(processed_root, in_root), "\n",
+    in_root_abs, "\n",
     "in_root must be relative to data/processed (e.g. '04_filtered')."
   )
 }
 
 # Check that we will NOT write into duplicated data/processed/data/processed
-out_root_abs <- file.path(processed_root, out_stage, policy_tag)
+out_root_abs <- file.path(repo_root, "data", "processed", out_stage, policy_tag)
 if (grepl("data/processed/data/processed", gsub("\\\\", "/", out_root_abs), fixed = TRUE)) {
   stop(
     "Output path has duplicated 'data/processed': ", out_root_abs, "\n",
