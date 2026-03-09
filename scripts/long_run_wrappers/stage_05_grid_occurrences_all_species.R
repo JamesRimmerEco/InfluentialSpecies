@@ -87,7 +87,7 @@ if (length(species_names) != 100) {
 # IMPORTANT: pass paths RELATIVE TO data/processed because the engine already
 # prefixes repo_root/data/processed internally. If you include data/processed here,
 # you will get duplicated paths like .../data/processed/data/processed/...
-in_root <- "04_filtered"
+in_root <- file.path("data", "processed", "04_filtered")
 
 # ---- Output identity ----------------------------------------------------------
 cell_km <- 1L
@@ -135,7 +135,7 @@ if (!is.na(limit_n)) species_names <- species_names[seq_len(min(limit_n, length(
 processed_root <- file.path(repo_root, "data", "processed")
 
 # Check that stage-04 exists in the place the engine will look
-in_root_abs <- file.path(repo_root, "data", "processed", in_root)
+in_root_abs <- file.path(repo_root, in_root)
 if (!dir.exists(in_root_abs)) {
   stop(
     "Stage 04 input folder not found at: ",
