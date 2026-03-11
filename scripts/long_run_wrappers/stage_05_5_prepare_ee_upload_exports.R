@@ -1,5 +1,3 @@
-#!/usr/bin/env Rscript
-
 # ==============================================================================
 # InfluentialSpecies — Stage 05.5 — Prepare Stage 05 presence-point exports
 # for manual Earth Engine upload
